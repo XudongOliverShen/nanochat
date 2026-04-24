@@ -1,0 +1,103 @@
+2026-04-23 14:50:07,403 - nanochat.common - [32m[1mINFO[0m - Distributed world size: 1
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home/svu/xudong_shen/.netrc.
+wandb: Currently logged in as: 374778994 to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run 3k5zhsxp
+wandb: Tracking run with wandb version 0.26.0
+wandb: Run data is saved locally in /scratch/xudong_shen/nanochat/wandb/run-20260423_145007-3k5zhsxp
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run speedrun
+wandb: ⭐️ View project at https://wandb.ai/374778994/nanochat
+wandb: 🚀 View run at https://wandb.ai/374778994/nanochat/runs/3k5zhsxp
+Traceback (most recent call last):
+  File "/home/svu/xudong_shen/myscratch/.local/share/uv/python/cpython-3.10.20-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/svu/xudong_shen/myscratch/.local/share/uv/python/cpython-3.10.20-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/scratch/xudong_shen/nanochat/scripts_dev/base_train.py", line 528, in <module>
+    x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+  File "/scratch/xudong_shen/nanochat/nanochat/dataloader.py", line 160, in tokenizing_distributed_data_loader_with_state_bos_bestfit
+    gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/home/svu/xudong_shen/myscratch/.local/share/uv/python/cpython-3.10.20-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/svu/xudong_shen/myscratch/.local/share/uv/python/cpython-3.10.20-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/scratch/xudong_shen/nanochat/scripts_dev/base_train.py", line 528, in <module>
+    x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+  File "/scratch/xudong_shen/nanochat/nanochat/dataloader.py", line 160, in tokenizing_distributed_data_loader_with_state_bos_bestfit
+    gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+KeyboardInterrupt
+[1;34mwandb[0m: 
+[1;34mwandb[0m: 🚀 View run [33mspeedrun[0m at: [34mhttps://wandb.ai/374778994/nanochat/runs/3k5zhsxp[0m
+[1;34mwandb[0m: Find logs at: [1;35m../../../../../scratch/xudong_shen/nanochat/wandb/run-20260423_145007-3k5zhsxp/logs[0m
+
+                                                       █████                █████
+                                                      ░░███                ░░███
+     ████████    ██████   ████████    ██████   ██████  ░███████    ██████  ███████
+    ░░███░░███  ░░░░░███ ░░███░░███  ███░░███ ███░░███ ░███░░███  ░░░░░███░░░███░
+     ░███ ░███   ███████  ░███ ░███ ░███ ░███░███ ░░░  ░███ ░███   ███████  ░███
+     ░███ ░███  ███░░███  ░███ ░███ ░███ ░███░███  ███ ░███ ░███  ███░░███  ░███ ███
+     ████ █████░░████████ ████ █████░░██████ ░░██████  ████ █████░░███████  ░░█████
+    ░░░░ ░░░░░  ░░░░░░░░ ░░░░ ░░░░░  ░░░░░░   ░░░░░░  ░░░░ ░░░░░  ░░░░░░░░   ░░░░░
+    
+Autodetected device type: cuda
+GPU: NVIDIA H200 | Peak FLOPS (BF16): 9.89e+14
+COMPUTE_DTYPE: torch.bfloat16 (auto-detected: CUDA SM 90 (bf16 supported))
+✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.
+Vocab size: 32,768
+Model config:
+{
+  "sequence_len": 2048,
+  "vocab_size": 32768,
+  "n_layer": 12,
+  "n_head": 6,
+  "n_kv_head": 6,
+  "n_embd": 768,
+  "window_pattern": "L",
+  "use_smear": false,
+  "use_resid_lambdas": false,
+  "use_value_residual": false,
+  "use_backout": false
+}
+Parameter counts:
+wte                     : 25,165,824
+value_embeds            : 0
+lm_head                 : 25,165,824
+transformer_matrices    : 84,934,656
+scalars                 : 0
+total                   : 135,266,304
+Estimated FLOPs per token: 8.870953e+08
+Auto-computed optimal batch size: 524,288 tokens
+Scaling the LR for the AdamW parameters ∝1/√(768/768) = 1.000000
+Calculated number of iterations from target data:param ratio: 1,680
+Total number of training tokens: 880,803,840
+Tokens : Scaling params ratio: 8.00
+Total training FLOPs estimate: 7.813569e+17
+Tokens / micro-batch / rank: 16 x 2048 = 32,768
+Tokens / micro-batch: 32,768
+Total batch size 524,288 => gradient accumulation steps: 16
+Step 00000 | Validation bpb: 3.169807
+step 00000/01680 (0.00%) | loss: 10.397321 | lrm: 0.03 | dt: 27355.74ms | tok/sec: 19,165 | bf16_mfu: 1.72 | epoch: 1 pq: 0 rg: 1 | total time: 0.00m
+step 00001/01680 (0.06%) | loss: 10.385106 | lrm: 0.05 | dt: 1000.58ms | tok/sec: 523,984 | bf16_mfu: 47.00 | epoch: 1 pq: 0 rg: 2 | total time: 0.00m
+step 00002/01680 (0.12%) | loss: 10.362840 | lrm: 0.07 | dt: 1010.12ms | tok/sec: 519,032 | bf16_mfu: 46.56 | epoch: 1 pq: 0 rg: 3 | total time: 0.00m
+step 00003/01680 (0.18%) | loss: 10.330469 | lrm: 0.10 | dt: 1010.48ms | tok/sec: 518,851 | bf16_mfu: 46.54 | epoch: 1 pq: 0 rg: 4 | total time: 0.00m
+step 00004/01680 (0.24%) | loss: 10.282925 | lrm: 0.12 | dt: 1011.70ms | tok/sec: 518,222 | bf16_mfu: 46.48 | epoch: 1 pq: 0 rg: 5 | total time: 0.00m
+step 00005/01680 (0.30%) | loss: 10.203736 | lrm: 0.15 | dt: 1011.82ms | tok/sec: 518,162 | bf16_mfu: 46.48 | epoch: 1 pq: 0 rg: 6 | total time: 0.00m
+step 00006/01680 (0.36%) | loss: 10.100057 | lrm: 0.17 | dt: 1012.23ms | tok/sec: 517,951 | bf16_mfu: 46.46 | epoch: 1 pq: 0 rg: 7 | total time: 0.00m
+step 00007/01680 (0.42%) | loss: 9.941438 | lrm: 0.20 | dt: 1011.31ms | tok/sec: 518,423 | bf16_mfu: 46.50 | epoch: 1 pq: 0 rg: 8 | total time: 0.00m
+step 00008/01680 (0.48%) | loss: 9.722818 | lrm: 0.23 | dt: 1010.92ms | tok/sec: 518,623 | bf16_mfu: 46.52 | epoch: 1 pq: 0 rg: 9 | total time: 0.00m
+step 00009/01680 (0.54%) | loss: 9.457294 | lrm: 0.25 | dt: 1013.73ms | tok/sec: 517,188 | bf16_mfu: 46.39 | epoch: 1 pq: 0 rg: 11 | total time: 0.00m
+step 00010/01680 (0.60%) | loss: 9.168116 | lrm: 0.28 | dt: 1012.37ms | tok/sec: 517,880 | bf16_mfu: 46.45 | epoch: 1 pq: 0 rg: 12 | total time: 0.00m
+step 00011/01680 (0.65%) | loss: 8.892342 | lrm: 0.30 | dt: 1013.02ms | tok/sec: 517,547 | bf16_mfu: 46.42 | epoch: 1 pq: 0 rg: 13 | total time: 0.02m | eta: 28.2m
+step 00012/01680 (0.71%) | loss: 8.667914 | lrm: 0.33 | dt: 1013.65ms | tok/sec: 517,230 | bf16_mfu: 46.39 | epoch: 1 pq: 0 rg: 14 | total time: 0.03m | eta: 28.2m
+step 00013/01680 (0.77%) | loss: 8.439453 | lrm: 0.35 | dt: 1012.23ms | tok/sec: 517,951 | bf16_mfu: 46.46 | epoch: 1 pq: 0 rg: 15 | total time: 0.05m | eta: 28.1m
+step 00014/01680 (0.83%) | loss: 8.225056 | lrm: 0.38 | dt: 1016.59ms | tok/sec: 515,732 | bf16_mfu: 46.26 | epoch: 1 pq: 0 rg: 16 | total time: 0.07m | eta: 28.2m
+step 00015/01680 (0.89%) | loss: 8.019515 | lrm: 0.40 | dt: 1014.98ms | tok/sec: 516,548 | bf16_mfu: 46.33 | epoch: 1 pq: 0 rg: 17 | total time: 0.08m | eta: 28.1m
+step 00016/01680 (0.95%) | loss: 7.826633 | lrm: 0.42 | dt: 1016.36ms | tok/sec: 515,847 | bf16_mfu: 46.27 | epoch: 1 pq: 0 rg: 18 | total time: 0.10m | eta: 28.1m
+step 00017/01680 (1.01%) | loss: 7.674192 | lrm: 0.45 | dt: 1018.32ms | tok/sec: 514,857 | bf16_mfu: 46.18 | epoch: 1 pq: 0 rg: 19 | total time: 0.12m | eta: 28.1m
+step 00018/01680 (1.07%) | loss: 7.523061 | lrm: 0.47 | dt: 1020.14ms | tok/sec: 513,936 | bf16_mfu: 46.10 | epoch: 1 pq: 0 rg: 20 | total time: 0.14m | eta: 28.1m
+step 00019/01680 (1.13%) | loss: 7.383169 | lrm: 0.50 | dt: 1021.32ms | tok/sec: 513,345 | bf16_mfu: 46.05 | epoch: 1 pq: 0 rg: 21 | total time: 0.15m | eta: 28.1m
+step 00020/01680 (1.19%) | loss: 7.240268 | lrm: 0.53 | dt: 1022.12ms | tok/sec: 512,944 | bf16_mfu: 46.01 | epoch: 1 pq: 0 rg: 22 | total time: 0.17m | eta: 28.1m
+step 00021/01680 (1.25%) | loss: 7.110771 | lrm: 0.55 | dt: 1020.43ms | tok/sec: 513,790 | bf16_mfu: 46.09 | epoch: 1 pq: 0 rg: 23 | total time: 0.19m | eta: 28.1m
+step 00022/01680 (1.31%) | loss: 6.996068 | lrm: 0.57 | dt: 1021.82ms | tok/sec: 513,090 | bf16_mfu: 46.02 | epoch: 1 pq: 0 rg: 24 | total time: 0.20m | eta: 28.1m
