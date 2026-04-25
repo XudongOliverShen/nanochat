@@ -75,17 +75,46 @@ fi
 # # evaluate the model: CORE metric, BPB on train/val, and draw samples
 # torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
 
-python -m scripts_dev.exp1_base_train \
+python -u -m scripts_dev.exp2_base_train \
     --depth=12 \
     --window-pattern=L \
     --target-param-data-ratio=8 \
-    --device-batch-size=32 \
-    --run=speedrun \
+    --device-batch-size=16 \
+    --max-seq-len=8192 \
+    --run=d12_ctx8192 \
     --no-smear \
     --no-resid-lambdas \
     --no-value-residual \
     --no-backout \
-    2>&1 | tee 2_pretraining.log
+    2>&1 | tee /home/svu/xudong_shen/myscratch/nanochat/runs_dev/2_pretraining_d12_ctx8192.log
+
+
+python -u -m scripts_dev.exp2_base_train \
+    --depth=12 \
+    --window-pattern=L \
+    --target-param-data-ratio=8 \
+    --device-batch-size=16 \
+    --max-seq-len=2048 \
+    --run=d12_ctx2048 \
+    --no-smear \
+    --no-resid-lambdas \
+    --no-value-residual \
+    --no-backout \
+    2>&1 | tee /home/svu/xudong_shen/myscratch/nanochat/runs_dev/2_pretraining_d12_ctx2048.log
+
+
+python -u -m scripts_dev.exp2_base_train \
+    --depth=12 \
+    --window-pattern=L \
+    --target-param-data-ratio=8 \
+    --device-batch-size=16 \
+    --max-seq-len=4096 \
+    --run=d12_ctx4096 \
+    --no-smear \
+    --no-resid-lambdas \
+    --no-value-residual \
+    --no-backout \
+    2>&1 | tee /home/svu/xudong_shen/myscratch/nanochat/runs_dev/2_pretraining_d12_ctx4096.log
 
 # # -----------------------------------------------------------------------------
 # # SFT (teach the model conversation special tokens, tool use, multiple choice)

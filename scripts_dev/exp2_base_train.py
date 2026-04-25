@@ -325,6 +325,7 @@ class GradientBiasMonitor:
                 def fwd_hook(module, inp, output):
                     if not module.training or not self._record_this_step:
                         return
+                    # print(f"[fwd]\t{'hidden':<6}\tL{layer_idx:02d}")
                     hidden = output[0] if isinstance(output, tuple) else output
                     if hidden.dim() != 3:
                         return
@@ -340,6 +341,7 @@ class GradientBiasMonitor:
                 def bwd_hook(module, grad_input, grad_output):
                     if not module.training or not self._record_this_step:
                         return
+                    # print(f"[bwd]\t{'hidden':<6}\tL{layer_idx:02d}")
                     g = grad_output[0]
                     if g is None or g.dim() != 3:
                         return
@@ -363,6 +365,7 @@ class GradientBiasMonitor:
                     def fwd_hook(module, inp, output):
                         if not module.training or not self._record_this_step:
                             return
+                        # print(f"[fwd]\t{'qkv':<6}\tL{layer_idx:02d}\t{qkv}")
                         B, T, _ = output.shape
                         act = output.detach().float().view(B, T, n_heads, head_dim)
                         per_norms = act.norm(dim=-1).to(torch.float16)  # (B, T, n_heads) on GPU
@@ -378,6 +381,7 @@ class GradientBiasMonitor:
                     def bwd_hook(module, grad_input, grad_output):
                         if not module.training or not self._record_this_step:
                             return
+                        # print(f"[bwd]\t{'qkv':<6}\tL{layer_idx:02d}\t{qkv}")
                         g = grad_output[0]
                         if g is None:
                             return
@@ -609,9 +613,9 @@ parser.add_argument("--no-backout",        action="store_true", help="disable mi
 
 # === NEW (norm monitoring): flags ===
 parser.add_argument("--monitor-debug", action="store_true", help="print a debug line when the first monitor fwd hook fires")
-parser.add_argument("--monitor-steps-per-file", type=int, default=10, help="flush one npz chunk per N recorded global steps")
+parser.add_argument("--monitor-steps-per-file", type=int, default=5, help="flush one npz chunk per N recorded global steps")
 parser.add_argument("--monitor-outlier-pct", type=float, default=0.01, help="fraction of largest values kept losslessly per sample")
-parser.add_argument("--monitor-record-every-k-steps", type=int, default=1, help="only record a fwd/bwd pass every K global steps (K=1 records every step)")
+parser.add_argument("--monitor-record-every-k-steps", type=int, default=20, help="only record a fwd/bwd pass every K global steps (K=1 records every step)")
 # === END NEW ===
 
 args = parser.parse_args()

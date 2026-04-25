@@ -1,14 +1,22 @@
 """Reader for per-token activation / gradient norm dumps.
 
 These files are produced by ``GradientBiasMonitor`` in
-``scripts_dev/exp1_base_train.py`` during training. Each training step emits
+``scripts_dev/exp2_base_train.py`` during training. The monitor records a
+fwd/bwd pass every ``--monitor-record-every-k-steps`` global steps (default
+20), so the recorded ``global_step`` values are typically *sparse* (e.g.
+``[0, 20, 40, ...]``), not contiguous. Each *recorded* step contributes
 (across all DDP ranks and grad-accumulation micro-steps) one batch of
 per-token hidden-state norms and per-(token, head) Q/K/V norms; the monitor
-batches ``--monitor-steps-per-file`` consecutive steps into one pair of npz
-files:
+batches ``--monitor-steps-per-file`` consecutive *recorded* steps into one
+pair of npz files:
 
     <logs_dir>/norms/step_{first}-{last}_hidden.npz
     <logs_dir>/norms/step_{first}-{last}_attn.npz
+
+Here ``{first}`` and ``{last}`` are the first and last *recorded* global_step
+ids in the file — the in-between ids may be skipped (stride =
+``record_every_k_steps``). The authoritative list of recorded ids is stored
+inside the file under the ``global_steps`` key.
 
 This module loads those files, de-quantizes them back to float32, and
 concatenates across files to cover a requested global-step range.
@@ -18,13 +26,16 @@ Data layout (what each returned array means)
 Each "sample" in the stacked arrays is identified by the implicit axis tuple
 ``(s, a, r, b, l, ...)`` with sizes:
 
-    S = # global_steps in the returned range   A = grad_accum_steps
+    S = # *recorded* global_steps actually present in the returned range
+        (may be sparse if --monitor-record-every-k-steps > 1)
+    A = grad_accum_steps
     R = world_size (# DDP ranks)               B = device_batch_size
     L = n_layer                                T = seq_len
     H_q = n_head (query heads)                 H_kv = n_kv_head (GQA kv heads)
 
 Axis meaning:
-    s -> global_step = result.global_steps[s]
+    s -> global_step = result.global_steps[s]   (do NOT assume s == global_step;
+         steps may be sparse — always look up the actual id via global_steps)
     a -> grad-accumulation micro-step index (0 .. A-1)
     r -> DDP rank (0 .. R-1)
     b -> per-rank sample index within the device batch (0 .. B-1)
@@ -55,38 +66,42 @@ positions. See ``outlier_pct`` in the returned metadata.
 Usage examples
 ==============
 
-1. Read hidden norms only, steps 0..3 inclusive::
+1. Read hidden norms only, all steps in [0, 40] inclusive::
 
      from plot_norm.read_norms import read_hidden
-     h = read_hidden("logs/speedrun_04241621/norms", 0, 3)
-     print(h.act.shape)           # (S, A, R, B, L, T) fp32
-     print(h.global_steps)        # e.g. array([0,1,2,3])
+     h = read_hidden("logs/speedrun_04251438/norms", 0, 40)
+     print(h.act.shape)           # (S, A, R, B, L, T) fp32 — S may be < 41
+     print(h.global_steps)        # e.g. array([0,10,20,30,40]) — possibly sparse
      print(h.layer_types)         # ['full_attention', 'sliding_attention', ...]
      # mean hidden-norm trajectory for layer 5, averaged over (a,r,b,t):
      import numpy as np
      traj = h.act[:, :, :, :, 5, :].mean(axis=(1,2,3,4))   # (S,)
+     # plot it against the ACTUAL step ids, not 0..S-1:
+     # plt.plot(h.global_steps, traj)
 
 2. Read attention norms only::
 
      from plot_norm.read_norms import read_attn
-     a = read_attn("logs/speedrun_04241621/norms", 0, 3)
+     a = read_attn("logs/speedrun_04251438/norms", 0, 40)
      print(a.q_act.shape)   # (S, A, R, B, L, T, H_q)
      print(a.k_act.shape)   # (S, A, R, B, L, T, H_kv)
-     # per-head mean Q-norm for layer 0 at step 0:
+     # per-head mean Q-norm for layer 0 at the *first recorded* step:
      qmean = a.q_act[0].mean(axis=(0,1,2,3))    # (H_q,)
+     # corresponding global_step is a.global_steps[0]
 
 3. Read both modalities over the same range::
 
      from plot_norm.read_norms import read_both
-     h, a = read_both("logs/speedrun_04241621/norms", 0, 3)
+     h, a = read_both("logs/speedrun_04251438/norms", 0, 40)
 
-4. Single step is a range of length 1::
+4. Range of length 1 — note that the requested step must actually have
+   been recorded, otherwise S=0 and a FileNotFoundError is raised::
 
-     h = read_hidden(".../norms", step_start=2, step_end=2)
+     h = read_hidden(".../norms", step_start=20, step_end=20)
 
 Running this file directly prints a summary for a default path::
 
-     python -m plot_norm.read_norms --norms-dir logs/.../norms --start 0 --end 3
+     python -m plot_norm.read_norms --norms-dir logs/.../norms --start 0 --end 40
 """
 
 from __future__ import annotations
@@ -109,6 +124,9 @@ class HiddenNorms:
     """Dequantized hidden-state norms over a global-step range.
 
     Shapes use symbols (S, A, R, B, L, T) described in the module docstring.
+    ``global_steps`` is the authoritative axis-0 -> global_step mapping; it
+    may be sparse (e.g. ``[0, 20, 40]``) — never assume S equals the width
+    of the requested range.
     """
     act: np.ndarray            # (S, A, R, B, L, T) float32   activation norms
     grad: np.ndarray           # (S, A, R, B, L, T) float32   gradient norms
@@ -128,6 +146,8 @@ class AttnNorms:
 
     Shapes use symbols (S, A, R, B, L, T, H_*) described in the module
     docstring. Q has head axis size H_q; K and V share head axis size H_kv.
+    ``global_steps`` is the authoritative axis-0 -> global_step mapping; it
+    may be sparse — never assume S equals the width of the requested range.
     """
     q_act: np.ndarray          # (S, A, R, B, L, T, H_q)
     q_grad: np.ndarray
@@ -157,7 +177,14 @@ _FNAME_RE = re.compile(r"step_(\d+)-(\d+)_(hidden|attn)\.npz$")
 def _discover_files(norms_dir: str, modality: str,
                     step_start: int, step_end: int) -> List[Tuple[int, int, str]]:
     """Return sorted [(first, last, path), ...] for files whose [first,last]
-    range overlaps [step_start, step_end]. Raises if nothing matches."""
+    range overlaps [step_start, step_end]. Raises if nothing matches.
+
+    ``first`` and ``last`` are the smallest and largest *recorded* global_step
+    ids inside the file (parsed from the filename) — under
+    ``--monitor-record-every-k-steps > 1`` the in-between ids are skipped, so
+    the bracket is sparse. The bracket is still a sound coarse-overlap test:
+    any file with at least one recorded step inside [step_start, step_end]
+    must have ``first <= step_end`` and ``last >= step_start``."""
     assert modality in ("hidden", "attn")
     if step_start > step_end:
         raise ValueError(f"step_start ({step_start}) > step_end ({step_end})")
@@ -226,7 +253,10 @@ def read_hidden(norms_dir: str, step_start: int, step_end: int) -> HiddenNorms:
     Returns
     -------
     HiddenNorms  with ``.act`` and ``.grad`` of shape (S, A, R, B, L, T),
-    where S = number of steps actually present in [start, end].
+    where ``S = number of recorded steps with step_start <= global_step <=
+    step_end``. Under ``--monitor-record-every-k-steps > 1`` this is
+    typically much smaller than ``step_end - step_start + 1``; consult
+    ``.global_steps`` for the actual ids.
     """
     files = _discover_files(norms_dir, "hidden", step_start, step_end)
 
@@ -278,6 +308,8 @@ def read_attn(norms_dir: str, step_start: int, step_end: int) -> AttnNorms:
     AttnNorms with ``q_act`` / ``q_grad`` of shape (S, A, R, B, L, T, H_q)
     and ``k_act`` / ``k_grad`` / ``v_act`` / ``v_grad`` of shape
     (S, A, R, B, L, T, H_kv). The on-disk k/v pair is split apart for you.
+    ``S = number of recorded steps with step_start <= global_step <=
+    step_end`` (may be sparse — see ``.global_steps``).
     """
     files = _discover_files(norms_dir, "attn", step_start, step_end)
 
