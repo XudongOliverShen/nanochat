@@ -42,9 +42,6 @@ class GPTConfig:
     use_resid_lambdas: bool = True
     use_value_residual: bool = True
     use_backout: bool = True
-    use_rope: bool = True
-    use_qknorm: bool = True
-    use_qk_scale: bool = True
 
 
 def norm(x):
@@ -77,9 +74,6 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
-        self.use_rope = config.use_rope
-        self.use_qknorm = config.use_qknorm
-        self.use_qk_scale = config.use_qk_scale
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
@@ -118,14 +112,11 @@ class CausalSelfAttention(nn.Module):
             v = v + gate.unsqueeze(-1) * ve
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
-        if self.use_rope:
-            cos, sin = cos_sin
-            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        if self.use_qknorm:
-            q, k = norm(q), norm(k) # QK norm
-        if self.use_qk_scale:
-            q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
-            k = k * 1.2
+        cos, sin = cos_sin
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q, k = norm(q), norm(k) # QK norm
+        q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
+        k = k * 1.2
 
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
@@ -175,6 +166,7 @@ class Block(nn.Module):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
         x = x + self.mlp(norm(x))
         return x
+
 
 class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
@@ -238,13 +230,11 @@ class GPT(nn.Module):
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
         # In the future we can dynamically grow the cache, for now it's fine.
-        # Skip entirely when RoPE is disabled (--no-rope): no rotary tables / buffers are built.
-        if config.use_rope:
-            self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute should be enough, TODO make nicer?
-            head_dim = config.n_embd // config.n_head
-            cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-            self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
-            self.register_buffer("sin", sin, persistent=False)
+        self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute should be enough, TODO make nicer?
+        head_dim = config.n_embd // config.n_head
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
+        self.register_buffer("sin", sin, persistent=False)
 
     @torch.no_grad()
     def init_weights(self):
@@ -306,11 +296,10 @@ class GPT(nn.Module):
                 if block.attn.ve_gate is not None:
                     torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
 
-        # Rotary embeddings (skipped entirely when RoPE is disabled, see --no-rope)
-        if self.config.use_rope:
-            head_dim = self.config.n_embd // self.config.n_head
-            cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-            self.cos, self.sin = cos, sin
+        # Rotary embeddings
+        head_dim = self.config.n_embd // self.config.n_head
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        self.cos, self.sin = cos, sin
 
         # Cast embeddings to COMPUTE_DTYPE: optimizer can tolerate reduced-precision
         # embeddings and it saves memory. Exception: fp16 requires fp32 embeddings
@@ -519,16 +508,12 @@ class GPT(nn.Module):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
-        # When RoPE is disabled (--no-rope) no rotary tables exist; pass cos_sin=None through.
-        if self.config.use_rope:
-            assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
-            assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
-            assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
-            # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
-            T0 = 0 if kv_cache is None else kv_cache.get_pos()
-            cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
-        else:
-            cos_sin = None
+        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
+        assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
+        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
+        T0 = 0 if kv_cache is None else kv_cache.get_pos()
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Embed the tokens
         x = self.transformer.wte(idx) # embed current token

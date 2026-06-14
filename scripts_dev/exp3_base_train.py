@@ -1,14 +1,25 @@
 """
-Train model. From root directory of the project, run as:
+exp3 clean trainer: identical to scripts/base_train.py, plus architecture-ablation flags.
 
-python -m scripts.base_train
+This is the monitor-free training script for the exp3 workflow. Train a model here (no
+instrumentation), then run scripts_dev/exp3_base_eval.py on the resulting checkpoint to record
+attention weights / input & gradient moments for the position-bias gradient theory.
+
+The ONLY differences from scripts/base_train.py are the ablation CLI flags
+(--no-smear / --no-resid-lambdas / --no-value-residual / --no-backout / --no-rope /
+--no-qknorm / --no-qk-scale) and wiring them into GPTConfig. Everything else (checkpointing,
+eval, sampling, schedulers, report logging) is unchanged.
+
+From root directory of the project, run as:
+
+python -m scripts_dev.exp3_base_train
 
 or distributed as:
 
-torchrun --nproc_per_node=8 -m scripts.base_train
+torchrun --nproc_per_node=8 -m scripts_dev.exp3_base_train
 
 If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
-python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
+python -m scripts_dev.exp3_base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
 """
 
 import os
@@ -35,588 +46,6 @@ from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
 print_banner()
-
-# =============================================================================
-# === NEW (norm monitoring): GradientBiasMonitor — collects per-token hidden
-# === and Q/K/V activation + gradient norms via forward/backward hooks on the
-# === uncompiled model; flushes dense-matrix npz chunks to <logs_dir>/norms.
-# === See class docstring for file/array layout.
-# =============================================================================
-import numpy as np
-from datetime import datetime
-
-
-def _quantize_uint8_batched(arr, outlier_pct):
-    """Vectorized per-row uint8 quantization with top-`outlier_pct` preserved losslessly.
-
-    arr: float32 (N, M). Returns:
-      q            uint8   (N, M)
-      scale        float32 (N,)
-      mn           float32 (N,)
-      outlier_idx  int32   (N, K)   K = max(1, int(M * outlier_pct))
-      outlier_val  float32 (N, K)
-
-    Dequant (row i): val = mn[i] + q[i] * scale[i], then splice
-    outlier_val[i] into positions outlier_idx[i].
-    """
-    assert arr.ndim == 2 and arr.dtype == np.float32
-    N, M = arr.shape
-    K = max(1, int(M * outlier_pct)) if outlier_pct > 0 else 1
-
-    top_idx = np.argpartition(arr, -K, axis=1)[:, -K:].astype(np.int32)          # (N, K)
-    outlier_val = np.take_along_axis(arr, top_idx, axis=1).astype(np.float32)    # (N, K)
-
-    # replace outlier positions with per-row min of the original row, then
-    # compute quant params on the cleaned array (mirrors the original scalar impl).
-    row_min_orig = arr.min(axis=1, keepdims=True).astype(np.float32)             # (N, 1)
-    a_clean = arr.copy()
-    rows = np.arange(N)[:, None]
-    a_clean[rows, top_idx] = row_min_orig
-
-    mn = a_clean.min(axis=1).astype(np.float32)                                  # (N,)
-    mx = a_clean.max(axis=1).astype(np.float32)
-    rng = mx - mn
-    scale = np.where(rng > 0, rng / 255.0, 1.0).astype(np.float32)               # (N,)
-    q = np.clip(np.round((a_clean - mn[:, None]) / scale[:, None]), 0, 255).astype(np.uint8)
-    return q, scale, mn, top_idx, outlier_val
-
-
-class GradientBiasMonitor:
-    """Capture per-token hidden / Q / K / V norms (fwd activations + bwd grads).
-
-    Hooks are attached on the uncompiled model (`orig_model.transformer.h[i]`).
-    For each layer, four per-token hidden residual-stream norms are recorded
-    (block_in, attn_in, attn_out, block_out; see stream_legend). Q/K/V
-    projections are recorded per-head (no head-mixing). `flush(step)` gathers
-    records across DDP ranks (all_gather_object) and writes dense-matrix npz
-    chunks on rank 0.
-
-    ────────────────────────────────────────────────────────────────────────────
-    OUTPUT FILES (under `<logs_dir>/norms/`, one pair per flush window)
-
-        step_{first}-{last}_hidden.npz
-        step_{first}-{last}_attn.npz
-
-    Flush windows cover `steps_per_file` consecutive global_steps (final flush
-    may be shorter). Within a window, dimension symbols are:
-
-        S = number of global_steps covered       A = grad_accum_steps
-        R = world_size (# DDP ranks)             B = device_batch_size
-        L = n_layer                              T = seq_len
-        H_q  = n_head (query heads)              H_kv = n_kv_head (kv heads; GQA)
-
-    Leading-axis convention (all stacked arrays): (S, A, R, B, L, …data…).
-
-    ─── {step_tag}_hidden.npz ───────────────────────────────────────────────
-    HS = 4 per-token residual-stream points per layer, indexed by stream_legend
-    (axis sits between B and L):
-      ["block_in", "attn_in", "attn_out", "block_out"]
-    For a block `x = x + attn(norm(x)); x = x + mlp(norm(x))`:
-      block_in  = x (block input)            attn_in  = norm(x) (attn input)
-      attn_out  = attn(norm(x)) (attn out)   block_out = block output
-
-      act_q              uint8   (S, A, R, B, HS, L, T)     quantized activation norms
-      act_scale          float32 (S, A, R, B, HS, L)        per-sample scale
-      act_min            float32 (S, A, R, B, HS, L)        per-sample min
-      act_outlier_idx    int32   (S, A, R, B, HS, L, K_h)   positions in [0, T)
-      act_outlier_val    float32 (S, A, R, B, HS, L, K_h)
-      grad_q / grad_scale / grad_min / grad_outlier_idx / grad_outlier_val
-                         same shapes as act_*               gradient norms
-      global_steps       int32   (S,)                       step value of axis-0 slice
-      layer_types        uint8   (L,)                       index into layer_type_legend
-      layer_type_legend  str     (2,)   ["full_attention","sliding_attention"]
-      stream_legend      str     (HS,)  ["block_in","attn_in","attn_out","block_out"]
-      format_version     int32   scalar (2 = multi-stream hidden)
-      n_elements / seq_len / device_batch_size / world_size / grad_accum_steps
-                         int32   scalars                    (n_elements = embed dim C)
-      outlier_pct        float32 scalar
-
-      K_h = max(1, int(T * outlier_pct))
-
-    ─── {step_tag}_attn.npz ─────────────────────────────────────────────────
-    GQA means H_q ≠ H_kv, so two rectangular groups share one file:
-      q_*  : query-only, head axis size H_q
-      kv_* : key+value, extra axis after L with size 2 (0=k, 1=v), head size H_kv
-
-      q_act_q            uint8   (S, A, R, B, L, T, H_q)
-      q_act_scale        float32 (S, A, R, B, L)
-      q_act_min          float32 (S, A, R, B, L)
-      q_act_outlier_idx  int32   (S, A, R, B, L, K_q)       flat indices into (T*H_q,)
-      q_act_outlier_val  float32 (S, A, R, B, L, K_q)
-      q_grad_*           (mirror of q_act_*)
-
-      kv_act_q           uint8   (S, A, R, B, L, 2, T, H_kv)
-      kv_act_scale       float32 (S, A, R, B, L, 2)
-      kv_act_min         float32 (S, A, R, B, L, 2)
-      kv_act_outlier_idx int32   (S, A, R, B, L, 2, K_kv)   flat indices into (T*H_kv,)
-      kv_act_outlier_val float32 (S, A, R, B, L, 2, K_kv)
-      kv_grad_*          (mirror of kv_act_*)
-
-      global_steps       int32   (S,)
-      layer_types        uint8   (L,)
-      layer_type_legend  str     (2,)   ["full_attention","sliding_attention"]
-      kv_legend          str     (2,)   ["k","v"]   — for axis 5 of kv_*
-      n_head / n_kv_head / head_dim / seq_len / device_batch_size / world_size /
-        grad_accum_steps int32   scalars
-      outlier_pct        float32 scalar
-
-      K_q  = max(1, int(T * H_q  * outlier_pct))
-      K_kv = max(1, int(T * H_kv * outlier_pct))
-
-    ─── INDEX RECOVERY ──────────────────────────────────────────────────────
-    For hidden array `X[s, a, r, b, hs, l, t]`:
-      global_step = global_steps[s]   accum_idx = a   rank = r
-      sample_idx  = b                 stream   = stream_legend[hs]
-      layer_idx   = l                 layer_type = layer_type_legend[layer_types[l]]
-
-    For attention:
-      Q value for sample (s,a,r,b,l) at token t head h: q_act_q[s,a,r,b,l,t,h]
-      K value: kv_act_q[s,a,r,b,l,0,t,h]    V value: kv_act_q[s,a,r,b,l,1,t,h]
-
-    ─── DEQUANTIZATION ──────────────────────────────────────────────────────
-    Per sample: val = min + q.astype(float32) * scale
-    Then overwrite positions in outlier_idx with outlier_val.
-    For attention samples, outlier indices are into the C-order flattened
-    (T, H) view: `flat_idx = t * H + h`.
-    """
-
-    def __init__(self, orig_model, logs_dir, rank=0, world_size=1,
-                 steps_per_file=2, outlier_pct=0.01,
-                 record_every_k_steps=1, debug=False):
-        self.model = orig_model
-        self.rank = int(rank)
-        self.world_size = int(world_size)
-        self._logs_dir = logs_dir
-        self._debug = debug
-        self._steps_per_file = int(steps_per_file)
-        self._outlier_pct = float(outlier_pct)
-        self._record_every_k = max(1, int(record_every_k_steps))
-        self._first_fwd_reported = False
-
-        self._global_step = 0
-        self._accum_idx = 0
-        self._s_idx = 0                   # within-window recorded-step index
-        self._record_this_step = False    # gate set by set_step()
-        self._recorded_steps = []         # global_steps currently in the staging slabs
-        self._configured = False          # True once configure() has allocated slabs
-        self._hooks = []
-
-        spec = self._introspect_model(orig_model)
-        self._hidden_modules    = spec["hidden_modules"]      # list of modules (forward output = hidden state)
-        self._attn_specs        = spec["attn_specs"]          # [{layer_idx, proj:{q,k,v}, n_heads:{q,k,v}, head_dim}, ...]
-        self._layer_types       = spec["layer_types"]         # list[str] parallel to hidden_modules
-        self._layer_type_legend = spec["layer_type_legend"]   # list[str] of distinct categories
-        self._n_head            = spec["n_head"]
-        self._n_kv_head         = spec["n_kv_head"]
-        self._head_dim          = spec["head_dim"]
-        self._n_layer           = len(self._hidden_modules)
-
-        # precompute metadata arrays used at flush time
-        _t2i = {t: i for i, t in enumerate(self._layer_type_legend)}
-        self._layer_type_legend_arr = np.array(self._layer_type_legend)
-        self._layer_types_arr = np.array([_t2i[t] for t in self._layer_types], dtype=np.uint8)
-
-        if self.rank == 0:
-            os.makedirs(os.path.join(logs_dir, "norms"), exist_ok=True)
-
-        self._setup_hooks()
-
-    # ---------------- step/accum tracking ----------------
-    def configure(self, grad_accum_steps, device_batch_size, seq_len):
-        """Allocate CPU fp16 staging slabs. Call once before the training loop,
-        after grad_accum_steps / device_batch_size / seq_len are known."""
-        A = int(grad_accum_steps)
-        B = int(device_batch_size)
-        T = int(seq_len)
-        K_win = self._steps_per_file
-        L = self._n_layer
-        H_q = self._n_head
-        H_kv = self._n_kv_head
-        self._A, self._B, self._T = A, B, T
-        # Hidden slabs: (K_win, A, HS, L, B, T)   HS = # residual-stream points per layer
-        HS = len(self._HIDDEN_STREAMS)
-        self._hidden_act  = torch.zeros((K_win, A, HS, L, B, T), dtype=torch.float16)
-        self._hidden_grad = torch.zeros((K_win, A, HS, L, B, T), dtype=torch.float16)
-        # Q slabs: (K_win, A, L, B, T, H_q)
-        self._q_act  = torch.zeros((K_win, A, L, B, T, H_q), dtype=torch.float16)
-        self._q_grad = torch.zeros((K_win, A, L, B, T, H_q), dtype=torch.float16)
-        # KV slabs: (K_win, A, L, 2, B, T, H_kv)   axis-3: 0=k, 1=v
-        self._kv_act  = torch.zeros((K_win, A, L, 2, B, T, H_kv), dtype=torch.float16)
-        self._kv_grad = torch.zeros((K_win, A, L, 2, B, T, H_kv), dtype=torch.float16)
-        self._configured = True
-
-    def set_step(self, global_step):
-        self._global_step = int(global_step)
-        self._accum_idx = 0
-        self._record_this_step = (self._global_step % self._record_every_k == 0)
-        if self._record_this_step:
-            self._s_idx = len(self._recorded_steps)
-            self._recorded_steps.append(self._global_step)
-
-    def advance_accum(self):
-        self._accum_idx += 1
-
-    # ---------------- model-specific introspection ----------------
-    @staticmethod
-    def _introspect_model(orig_model):
-        """Discover hook points and layer metadata for a given model.
-
-        This is the ONLY model-specific method. To port GradientBiasMonitor to a
-        new architecture, edit this method. Everything else is model-agnostic
-        and works off the returned spec.
-
-        Returns a dict:
-          hidden_modules    : list of nn.Module — forward output is hidden state (B, T, C)
-          attn_specs        : list of {layer_idx, proj:{q,k,v}, n_heads:{q,k,v}, head_dim}
-                              — one entry per block that has a Q/K/V attention subblock;
-                              n_heads may differ across q vs k/v (GQA) but MUST be the same
-                              across layers for the current dense-matrix flush layout.
-          layer_types       : list[str], one per hidden_module (used for analysis grouping)
-          layer_type_legend : list[str] of all distinct category labels that can appear in
-                              layer_types (fixed up-front so the legend is stable across
-                              checkpoints even if a run happens not to use some label).
-          n_head / n_kv_head / head_dim : int scalars shared across attn_specs.
-        """
-        # --- hidden-state hook points: each transformer block's output (B, T, C) ---
-        hidden_modules = list(orig_model.transformer.h)
-
-        # --- layer-type classification (full vs sliding attention) ---
-        seq_len = orig_model.config.sequence_len
-        layer_types = []
-        for i in range(len(hidden_modules)):
-            left, _right = orig_model.window_sizes[i]
-            if left < 0 or left >= seq_len:
-                layer_types.append("full_attention")
-            else:
-                layer_types.append("sliding_attention")
-        layer_type_legend = ["full_attention", "sliding_attention"]
-
-        # --- Q/K/V hook points: auto-detect blocks that expose c_q / c_k / c_v ---
-        attn_specs = []
-        for i, block in enumerate(hidden_modules):
-            attn = getattr(block, "attn", None)
-            if attn is None or not all(hasattr(attn, n) for n in ("c_q", "c_k", "c_v")):
-                continue
-            attn_specs.append({
-                "layer_idx": i,
-                "proj":    {"q": attn.c_q, "k": attn.c_k, "v": attn.c_v},
-                "n_heads": {"q": int(attn.n_head),
-                            "k": int(attn.n_kv_head),
-                            "v": int(attn.n_kv_head)},
-                "head_dim": int(attn.head_dim),
-            })
-
-        # current flush layout requires shared head shapes across attention layers
-        if attn_specs:
-            s0 = attn_specs[0]
-            n_head, n_kv_head, head_dim = s0["n_heads"]["q"], s0["n_heads"]["k"], s0["head_dim"]
-            for s in attn_specs[1:]:
-                assert s["n_heads"]["q"] == n_head and s["n_heads"]["k"] == n_kv_head, \
-                    "GradientBiasMonitor requires identical head counts across attn layers"
-                assert s["head_dim"] == head_dim, \
-                    "GradientBiasMonitor requires identical head_dim across attn layers"
-        else:
-            n_head = n_kv_head = head_dim = 0
-
-        return {
-            "hidden_modules": hidden_modules,
-            "attn_specs": attn_specs,
-            "layer_types": layer_types,
-            "layer_type_legend": layer_type_legend,
-            "n_head": n_head, "n_kv_head": n_kv_head, "head_dim": head_dim,
-        }
-
-    # ---------------- hook setup ----------------
-    _KV_IDX = {"k": 0, "v": 1}
-    # Per-token hidden residual-stream points captured per layer (act + grad).
-    # For a block `x = x + attn(norm(x)); x = x + mlp(norm(x))`:
-    #   block_in  = x (block input)            attn_in  = norm(x) (attn input)
-    #   attn_out  = attn(norm(x)) (attn output) block_out = block output
-    _HIDDEN_STREAMS = ("block_in", "attn_in", "attn_out", "block_out")
-    _HS_IDX = {name: i for i, name in enumerate(_HIDDEN_STREAMS)}
-
-    def _write_hidden(self, slab, stream_name, layer_idx, tensor):
-        """Compute per-token L2 norm of a (B, T, C) tensor and copy into the
-        right (stream, layer) slot of a hidden slab. No-op if tensor is not 3-D."""
-        if tensor is None or tensor.dim() != 3:
-            return
-        norms = tensor.detach().float().norm(dim=-1).to(torch.float16)  # (B, T) on GPU
-        slab[self._s_idx, self._accum_idx, self._HS_IDX[stream_name], layer_idx].copy_(norms)
-
-    def _setup_hooks(self):
-        # --- hidden-state hooks: capture 4 residual-stream points per layer ---
-        # Each layer needs only two module hook pairs:
-        #   * the Block module       -> block_in (fwd inp[0] / bwd grad_input[0])
-        #                               block_out (fwd output / bwd grad_output[0])
-        #   * the block.attn module  -> attn_in  (fwd inp[0] / bwd grad_input[0])
-        #                               attn_out (fwd output / bwd grad_output[0])
-        def _first(x):
-            return x[0] if isinstance(x, tuple) else x
-
-        for i, block in enumerate(self._hidden_modules):
-
-            # ---- Block: block_in (input) + block_out (output) ----
-            def make_fwd_block(layer_idx):
-                def fwd_hook(module, inp, output):
-                    if not module.training or not self._record_this_step:
-                        return
-                    if self._debug and not self._first_fwd_reported and layer_idx == 0:
-                        h = _first(output)
-                        print(f"[monitor] first hidden fwd fired (layer=0, shape={tuple(h.shape)})")
-                        self._first_fwd_reported = True
-                    self._write_hidden(self._hidden_act, "block_in",  layer_idx, _first(inp))
-                    self._write_hidden(self._hidden_act, "block_out", layer_idx, _first(output))
-                return fwd_hook
-
-            def make_bwd_block(layer_idx):
-                def bwd_hook(module, grad_input, grad_output):
-                    if not module.training or not self._record_this_step:
-                        return
-                    self._write_hidden(self._hidden_grad, "block_in",  layer_idx, _first(grad_input))
-                    self._write_hidden(self._hidden_grad, "block_out", layer_idx, _first(grad_output))
-                return bwd_hook
-
-            self._hooks.append(block.register_forward_hook(make_fwd_block(i)))
-            self._hooks.append(block.register_full_backward_hook(make_bwd_block(i)))
-
-            # ---- attn: attn_in (input = norm(x)) + attn_out (output) ----
-            attn = getattr(block, "attn", None)
-            if attn is None:
-                continue
-
-            def make_fwd_attn(layer_idx):
-                def fwd_hook(module, inp, output):
-                    if not module.training or not self._record_this_step:
-                        return
-                    self._write_hidden(self._hidden_act, "attn_in",  layer_idx, _first(inp))
-                    self._write_hidden(self._hidden_act, "attn_out", layer_idx, _first(output))
-                return fwd_hook
-
-            def make_bwd_attn(layer_idx):
-                def bwd_hook(module, grad_input, grad_output):
-                    if not module.training or not self._record_this_step:
-                        return
-                    self._write_hidden(self._hidden_grad, "attn_in",  layer_idx, _first(grad_input))
-                    self._write_hidden(self._hidden_grad, "attn_out", layer_idx, _first(grad_output))
-                return bwd_hook
-
-            self._hooks.append(attn.register_forward_hook(make_fwd_attn(i)))
-            self._hooks.append(attn.register_full_backward_hook(make_bwd_attn(i)))
-
-        # --- Q/K/V hooks on every discovered attention layer ---
-        for spec in self._attn_specs:
-            i = spec["layer_idx"]
-            head_dim = spec["head_dim"]
-            for qkv_name, proj in spec["proj"].items():
-                n_heads = spec["n_heads"][qkv_name]
-
-                def make_fwd_qkv(layer_idx, qkv, n_heads, head_dim):
-                    is_q = (qkv == "q")
-                    kv_i = self._KV_IDX.get(qkv, 0)
-                    def fwd_hook(module, inp, output):
-                        if not module.training or not self._record_this_step:
-                            return
-                        # print(f"[fwd]\t{'qkv':<6}\tL{layer_idx:02d}\t{qkv}")
-                        B, T, _ = output.shape
-                        act = output.detach().float().view(B, T, n_heads, head_dim)
-                        per_norms = act.norm(dim=-1).to(torch.float16)  # (B, T, n_heads) on GPU
-                        if is_q:
-                            self._q_act[self._s_idx, self._accum_idx, layer_idx].copy_(per_norms)
-                        else:
-                            self._kv_act[self._s_idx, self._accum_idx, layer_idx, kv_i].copy_(per_norms)
-                    return fwd_hook
-
-                def make_bwd_qkv(layer_idx, qkv, n_heads, head_dim):
-                    is_q = (qkv == "q")
-                    kv_i = self._KV_IDX.get(qkv, 0)
-                    def bwd_hook(module, grad_input, grad_output):
-                        if not module.training or not self._record_this_step:
-                            return
-                        # print(f"[bwd]\t{'qkv':<6}\tL{layer_idx:02d}\t{qkv}")
-                        g = grad_output[0]
-                        if g is None:
-                            return
-                        B, T, _ = g.shape
-                        g_r = g.detach().float().view(B, T, n_heads, head_dim)
-                        gn = g_r.norm(dim=-1).to(torch.float16)  # (B, T, n_heads)
-                        if is_q:
-                            self._q_grad[self._s_idx, self._accum_idx, layer_idx].copy_(gn)
-                        else:
-                            self._kv_grad[self._s_idx, self._accum_idx, layer_idx, kv_i].copy_(gn)
-                    return bwd_hook
-
-                self._hooks.append(proj.register_forward_hook(
-                    make_fwd_qkv(i, qkv_name, n_heads, head_dim)))
-                self._hooks.append(proj.register_full_backward_hook(
-                    make_bwd_qkv(i, qkv_name, n_heads, head_dim)))
-
-    # ---------------- flush (write npz) ----------------
-    def _gather_slab(self, cpu_slice):
-        """Gather a CPU fp16 tensor across DDP ranks as fp16 numpy.
-        Returns np.ndarray of shape (R, *cpu_slice.shape) on rank 0; None elsewhere.
-        For single-rank runs returns (1, *shape).
-
-        Uses all_gather_object on numpy arrays to keep data on CPU — the slabs
-        can be large and round-tripping through GPU for gather would balloon
-        VRAM at flush time."""
-        local_np = cpu_slice.contiguous().numpy()
-        if self.world_size <= 1 or not is_ddp_initialized():
-            return local_np[None, ...]
-        gathered = [None] * self.world_size
-        dist.all_gather_object(gathered, local_np)
-        if self.rank == 0:
-            return np.stack(gathered, axis=0)
-        return None
-
-    def flush(self, global_step=None, force=False):
-        if not self._configured:
-            return
-        n = len(self._recorded_steps)
-        # Decide whether to write now.
-        if n == 0:
-            return
-        if not force and n < self._steps_per_file:
-            return
-
-        # Gather slabs across DDP ranks (every rank participates in collectives).
-        hidden_act_g  = self._gather_slab(self._hidden_act[:n])     # (R, n, A, HS, L, B, T) or None
-        hidden_grad_g = self._gather_slab(self._hidden_grad[:n])
-        q_act_g   = self._gather_slab(self._q_act[:n])              # (R, n, A, L, B, T, H_q)
-        q_grad_g  = self._gather_slab(self._q_grad[:n])
-        kv_act_g  = self._gather_slab(self._kv_act[:n])             # (R, n, A, L, 2, B, T, H_kv)
-        kv_grad_g = self._gather_slab(self._kv_grad[:n])
-
-        # Reset staging for the next window (every rank).
-        recorded_steps = self._recorded_steps
-        self._recorded_steps = []
-        self._s_idx = 0
-
-        if self.rank != 0:
-            return
-
-        # Permute gathered axes into the on-disk layout expected by readers.
-        #   hidden: (R, n=S, A, HS, L, B, T)   -> (S, A, R, B, HS, L, T)
-        #   q:      (R, n=S, A, L, B, T, H_q)  -> (S, A, R, B, L, T, H_q)
-        #   kv:     (R, n=S, A, L, 2, B, T, H_kv) -> (S, A, R, B, L, 2, T, H_kv)
-        act = hidden_act_g.transpose(1, 2, 0, 5, 3, 4, 6).astype(np.float32)
-        grd = hidden_grad_g.transpose(1, 2, 0, 5, 3, 4, 6).astype(np.float32)
-        q_act  = q_act_g.transpose(1, 2, 0, 4, 3, 5, 6).astype(np.float32)
-        q_grd  = q_grad_g.transpose(1, 2, 0, 4, 3, 5, 6).astype(np.float32)
-        kv_act = kv_act_g.transpose(1, 2, 0, 5, 3, 4, 6, 7).astype(np.float32)
-        kv_grd = kv_grad_g.transpose(1, 2, 0, 5, 3, 4, 6, 7).astype(np.float32)
-
-        S = n
-        A = self._A
-        R = self.world_size
-        B = self._B
-        L = self._n_layer
-        T = self._T
-        HS = len(self._HIDDEN_STREAMS)
-        H_q, H_kv = self._n_head, self._n_kv_head
-        # hidden embed dim C — read from model config (was always a scalar in the output).
-        n_elements = int(self.model.config.n_embd)
-
-        layer_type_legend = self._layer_type_legend_arr
-        layer_types_arr = self._layer_types_arr
-        global_steps_arr = np.array(recorded_steps, dtype=np.int32)
-        step_tag = f"step_{recorded_steps[0]}-{recorded_steps[-1]}"
-        out_dir = os.path.join(self._logs_dir, "norms")
-
-        # -------- HIDDEN (4 residual-stream points; axis after B is HS) --------
-        def _quant_hidden(x):
-            N = S * A * R * B * HS * L
-            flat = x.reshape(N, T)
-            q, sc, mn, oi, ov = _quantize_uint8_batched(flat, self._outlier_pct)
-            K = oi.shape[1]
-            return (q.reshape(S, A, R, B, HS, L, T),
-                    sc.reshape(S, A, R, B, HS, L),
-                    mn.reshape(S, A, R, B, HS, L),
-                    oi.reshape(S, A, R, B, HS, L, K),
-                    ov.reshape(S, A, R, B, HS, L, K))
-
-        aq, asc, amn, aoi, aov = _quant_hidden(act)
-        gq, gsc, gmn, goi, gov = _quant_hidden(grd)
-
-        np.savez_compressed(
-            os.path.join(out_dir, f"{step_tag}_hidden.npz"),
-            act_q=aq, act_scale=asc, act_min=amn,
-            act_outlier_idx=aoi, act_outlier_val=aov,
-            grad_q=gq, grad_scale=gsc, grad_min=gmn,
-            grad_outlier_idx=goi, grad_outlier_val=gov,
-            global_steps=global_steps_arr,
-            layer_types=layer_types_arr,
-            layer_type_legend=layer_type_legend,
-            stream_legend=np.array(self._HIDDEN_STREAMS),
-            format_version=np.int32(2),
-            n_elements=np.int32(n_elements),
-            seq_len=np.int32(T),
-            device_batch_size=np.int32(B),
-            world_size=np.int32(R),
-            grad_accum_steps=np.int32(A),
-            outlier_pct=np.float32(self._outlier_pct),
-        )
-
-        # -------- ATTENTION --------
-        if H_q > 0 and H_kv > 0:
-            def _quant_attn_q(x):
-                N = S * A * R * B * L
-                flat = x.reshape(N, T * H_q)
-                q, sc, mn, oi, ov = _quantize_uint8_batched(flat, self._outlier_pct)
-                K = oi.shape[1]
-                return (q.reshape(S, A, R, B, L, T, H_q),
-                        sc.reshape(S, A, R, B, L),
-                        mn.reshape(S, A, R, B, L),
-                        oi.reshape(S, A, R, B, L, K),
-                        ov.reshape(S, A, R, B, L, K))
-
-            def _quant_attn_kv(x):
-                N = S * A * R * B * L * 2
-                flat = x.reshape(N, T * H_kv)
-                q, sc, mn, oi, ov = _quantize_uint8_batched(flat, self._outlier_pct)
-                K = oi.shape[1]
-                return (q.reshape(S, A, R, B, L, 2, T, H_kv),
-                        sc.reshape(S, A, R, B, L, 2),
-                        mn.reshape(S, A, R, B, L, 2),
-                        oi.reshape(S, A, R, B, L, 2, K),
-                        ov.reshape(S, A, R, B, L, 2, K))
-
-            qaq, qasc, qamn, qaoi, qaov = _quant_attn_q(q_act)
-            qgq, qgsc, qgmn, qgoi, qgov = _quant_attn_q(q_grd)
-            kvaq, kvasc, kvamn, kvaoi, kvaov = _quant_attn_kv(kv_act)
-            kvgq, kvgsc, kvgmn, kvgoi, kvgov = _quant_attn_kv(kv_grd)
-
-            np.savez_compressed(
-                os.path.join(out_dir, f"{step_tag}_attn.npz"),
-                q_act_q=qaq, q_act_scale=qasc, q_act_min=qamn,
-                q_act_outlier_idx=qaoi, q_act_outlier_val=qaov,
-                q_grad_q=qgq, q_grad_scale=qgsc, q_grad_min=qgmn,
-                q_grad_outlier_idx=qgoi, q_grad_outlier_val=qgov,
-                kv_act_q=kvaq, kv_act_scale=kvasc, kv_act_min=kvamn,
-                kv_act_outlier_idx=kvaoi, kv_act_outlier_val=kvaov,
-                kv_grad_q=kvgq, kv_grad_scale=kvgsc, kv_grad_min=kvgmn,
-                kv_grad_outlier_idx=kvgoi, kv_grad_outlier_val=kvgov,
-                global_steps=global_steps_arr,
-                layer_types=layer_types_arr,
-                layer_type_legend=layer_type_legend,
-                kv_legend=np.array(["k", "v"]),
-                n_head=np.int32(H_q),
-                n_kv_head=np.int32(H_kv),
-                head_dim=np.int32(self._head_dim),
-                seq_len=np.int32(T),
-                device_batch_size=np.int32(B),
-                world_size=np.int32(R),
-                grad_accum_steps=np.int32(A),
-                outlier_pct=np.float32(self._outlier_pct),
-            )
-
-    def remove_hooks(self):
-        for h in self._hooks:
-            try:
-                h.remove()
-            except Exception:
-                pass
-        self._hooks.clear()
-# === END NEW ===
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -659,20 +88,14 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
-
+# Architecture ablations (exp3 additions)
 parser.add_argument("--no-smear",          action="store_true", help="disable smear (prev-token embedding mixing)")
 parser.add_argument("--no-resid-lambdas",  action="store_true", help="disable per-layer resid_λ·x + x0_λ·x₀ mixing")
 parser.add_argument("--no-value-residual", action="store_true", help="disable ResFormer value embeddings")
 parser.add_argument("--no-backout",        action="store_true", help="disable mid-layer backout subtraction")
-parser.add_argument("--no-rope",            action="store_true", help="disable RoPE (rotary positional embedding); QK-norm and x1.2 sharpening are kept")
-
-# === NEW (norm monitoring): flags ===
-parser.add_argument("--monitor-debug", action="store_true", help="print a debug line when the first monitor fwd hook fires")
-parser.add_argument("--monitor-steps-per-file", type=int, default=5, help="flush one npz chunk per N recorded global steps")
-parser.add_argument("--monitor-outlier-pct", type=float, default=0.01, help="fraction of largest values kept losslessly per sample")
-parser.add_argument("--monitor-record-every-k-steps", type=int, default=20, help="only record a fwd/bwd pass every K global steps (K=1 records every step)")
-# === END NEW ===
-
+parser.add_argument("--no-rope",           action="store_true", help="disable RoPE (rotary positional embedding)")
+parser.add_argument("--no-qknorm",         action="store_true", help="disable QK-norm on Q/K")
+parser.add_argument("--no-qk-scale",       action="store_true", help="disable the x1.2 Q/K sharpening scale")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -681,28 +104,6 @@ user_config = vars(args).copy()  # for logging
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-
-# =============================================================================
-# === NEW (norm monitoring): experiment_name + logs_dir, DDP-safe
-# =============================================================================
-# Rank 0 computes the timestamp; broadcast string so all ranks agree.
-if master_process:
-    _ts = datetime.now().strftime("%m%d%H%M")
-    experiment_name = f"{args.run}_{_ts}"
-else:
-    experiment_name = None
-if is_ddp_initialized():
-    _obj = [experiment_name]
-    dist.broadcast_object_list(_obj, src=0)
-    experiment_name = _obj[0]
-_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-logs_dir = os.path.join(_project_root, "logs", experiment_name)
-if master_process:
-    os.makedirs(logs_dir, exist_ok=True)
-print0(f"Experiment name: {experiment_name}")
-print0(f"Logs dir: {logs_dir}")
-# === END NEW ===
-
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 if device_type == "cuda":
@@ -760,6 +161,8 @@ def build_model_meta(depth):
         use_value_residual = not args.no_value_residual,
         use_backout        = not args.no_backout,
         use_rope           = not args.no_rope,
+        use_qknorm         = not args.no_qknorm,
+        use_qk_scale       = not args.no_qk_scale,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -866,22 +269,6 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-
-# =============================================================================
-# === NEW (norm monitoring): attach hooks on the uncompiled model
-# =============================================================================
-monitor = GradientBiasMonitor(
-    orig_model, logs_dir,
-    rank=ddp_rank, world_size=ddp_world_size,
-    steps_per_file=args.monitor_steps_per_file,
-    outlier_pct=args.monitor_outlier_pct,
-    record_every_k_steps=args.monitor_record_every_k_steps,
-    debug=args.monitor_debug,
-)
-print0(f"GradientBiasMonitor attached: {len(orig_model.transformer.h)} layers "
-       f"(layer_types={monitor._layer_types})")
-# === END NEW ===
-
 model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
@@ -1051,12 +438,6 @@ print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_l
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
-# === NEW (norm monitoring): now that A/B/T are all known, allocate the monitor's staging slabs. ===
-monitor.configure(grad_accum_steps=grad_accum_steps,
-                  device_batch_size=args.device_batch_size,
-                  seq_len=args.max_seq_len)
-# === END NEW ===
-
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
@@ -1152,9 +533,6 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
-    # === NEW (norm monitoring): reset per-step accum index / fwd cache ===
-    monitor.set_step(step)
-    # === END NEW ===
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         train_loss = loss.detach() # for logging
@@ -1164,9 +542,6 @@ while True:
         else:
             loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-        # === NEW (norm monitoring): advance accum index so next micro-step caches separately ===
-        monitor.advance_accum()
-        # === END NEW ===
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -1189,9 +564,6 @@ while True:
     else:
         optimizer.step()
     model.zero_grad(set_to_none=True)
-    # === NEW (norm monitoring): flush collected records to parquet ===
-    monitor.flush(step)
-    # === END NEW ===
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
@@ -1278,11 +650,6 @@ get_report().log(section="Base model training", data=[
         "Peak memory usage": f"{get_max_memory() / 1024 / 1024:.2f}MiB",
     }
 ])
-
-# === NEW (norm monitoring): force-drain remaining records, then remove hooks ===
-monitor.flush(step, force=True)
-monitor.remove_hooks()
-# === END NEW ===
 
 # cleanup
 wandb_run.finish() # wandb run finish

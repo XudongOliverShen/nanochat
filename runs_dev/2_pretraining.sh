@@ -10,7 +10,8 @@
 # 3) Example launch with wandb logging, but see below for setting up wandb first:
 # WANDB_RUN=speedrun screen -L -Logfile runs/speedrun.log -S speedrun bash runs/speedrun.sh
 
-# Default intermediate artifacts directory is in ~/.cache/nanochat
+# Default intermediate artifacts directory is in ~/.cache/nanochat. The repo's ./.cache is a
+# symlink to it, so artifacts are reachable from inside the repo too.
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
@@ -75,46 +76,55 @@ fi
 # # evaluate the model: CORE metric, BPB on train/val, and draw samples
 # torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
 
-python -u -m scripts_dev.exp2_base_train \
-    --depth=12 \
-    --window-pattern=L \
-    --target-param-data-ratio=8 \
-    --device-batch-size=16 \
-    --max-seq-len=8192 \
-    --run=d12_ctx8192 \
-    --no-smear \
-    --no-resid-lambdas \
-    --no-value-residual \
-    --no-backout \
-    2>&1 | tee /home/svu/xudong_shen/myscratch/nanochat/runs_dev/2_pretraining_d12_ctx8192.log
 
 
-python -u -m scripts_dev.exp2_base_train \
+# device_batch_size: 单卡单次 fwd/bwd 处理的序列条数。
+#   全局总 token 数 = device_batch_size × max_seq_len × world_size × grad_accum_steps
+#   脚本会断言 total_batch_size 必须能被 (device_batch_size × max_seq_len × world_size) 整除。
+#
+# 原来 =16 报错的原因：
+#   16 × 8192 × 8 = 1,048,576  > 自动算出的 total_batch_size = 524,288
+#   单步 token 已是目标总 batch 的 2 倍，grad_accum 最小为 1 也无法整除 → AssertionError。
+#
+# 改成 =8 的原因 / 约束：
+#   8 × 8192 × 8 = 524,288 = total_batch_size，正好整除，grad_accum_steps=1。
+#   约束：device_batch_size × max_seq_len × 8 必须整除 524,288；
+#         且受单卡显存上限限制（8192 长上下文下不能设太大）。
+#         可选更小值 4（grad_accum_steps=2，更省显存但更慢）。
+
+# torchrun --standalone --nproc_per_node=8 -m scripts_dev.exp2_base_train -- \
+#     --depth=12 \
+#     --window-pattern=L \
+#     --target-param-data-ratio=40 \
+#     --device-batch-size=8 \
+#     --max-seq-len=8192 \
+#     --run=d12_ctx8192 \
+#     --no-smear \
+#     --no-resid-lambdas \
+#     --no-value-residual \
+#     --no-backout \
+#     2>&1 | tee /fsx/home/xudong.shen/work/attn-bias/nanochat/runs_dev/2_pretraining_d12_ctx8192.log
+
+
+torchrun --standalone --nproc_per_node=8 -m scripts_dev.exp3_base_train -- \
     --depth=12 \
     --window-pattern=L \
-    --target-param-data-ratio=8 \
-    --device-batch-size=16 \
+    --target-param-data-ratio=20 \
+    --device-batch-size=32 \
     --max-seq-len=2048 \
-    --run=d12_ctx2048 \
+    --run=pretrain_d12_ctx2048 \
+    --model-tag=pretrain_d12_ctx2048 \
+    --save-every=1000 \
     --no-smear \
     --no-resid-lambdas \
     --no-value-residual \
     --no-backout \
-    2>&1 | tee /home/svu/xudong_shen/myscratch/nanochat/runs_dev/2_pretraining_d12_ctx2048.log
+    --no-rope \
+    --no-qknorm \
+    --no-qk-scale \
+    2>&1 | tee /fsx/home/xudong.shen/work/attn-bias/nanochat/runs_dev/3_pretraining_d12_ctx2048.log
 
 
-python -u -m scripts_dev.exp2_base_train \
-    --depth=12 \
-    --window-pattern=L \
-    --target-param-data-ratio=8 \
-    --device-batch-size=16 \
-    --max-seq-len=4096 \
-    --run=d12_ctx4096 \
-    --no-smear \
-    --no-resid-lambdas \
-    --no-value-residual \
-    --no-backout \
-    2>&1 | tee /home/svu/xudong_shen/myscratch/nanochat/runs_dev/2_pretraining_d12_ctx4096.log
 
 # # -----------------------------------------------------------------------------
 # # SFT (teach the model conversation special tokens, tool use, multiple choice)

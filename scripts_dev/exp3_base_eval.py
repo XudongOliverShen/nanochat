@@ -1,14 +1,58 @@
 """
-Train model. From root directory of the project, run as:
+exp3 eval-time recorder for the position-bias attention-gradient theory.
 
-python -m scripts.base_train
+This is a FORK of scripts_dev/exp2_base_train.py used as an *eval* pass (forward+backward,
+NO optimizer step — the model is loaded from a checkpoint and stays fixed). It reuses all of
+exp2's GradientBiasMonitor machinery (4-stream hidden norms + per-head Q/K/V act/grad norms,
+large-file chunking, flush-every-K, DDP gather) and ADDS recording of the quantities needed to
+verify the closed-form gradient theory, written to a new `{step}_attnstat.npz` file.
 
-or distributed as:
+Run as (single GPU; disable torch.compile so the eager attention + hooks are reliable):
 
-torchrun --nproc_per_node=8 -m scripts.base_train
+    TORCHDYNAMO_DISABLE=1 torchrun --standalone --nproc_per_node=1 \
+        -m scripts_dev.exp3_base_eval -- --model-tag=<tag> [--step=<n>] \
+        --depth=... --max-seq-len=... --no-rope --no-qknorm --no-qk-scale ...
 
-If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
-python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
+═══════════════════════════════════════════════════════════════════════════════════════════
+THEORY  (see simulation/gradient_position_bias_simulation.ipynb)
+═══════════════════════════════════════════════════════════════════════════════════════════
+Single-head causal scaled-dot-product attention with i.i.d. Gaussian inputs and an upstream
+gradient sampled independently of the inputs:
+
+    x_i ~ N(mu_x, Sigma_x)                         # input tokens (here: the attn input norm(x))
+    q_i = W_Q x_i,  k_i = W_K x_i,  v_i = W_V x_i  # LINEAR projections (no RoPE/QK-norm/scale)
+    alpha_{r->s} = softmax_r( q_s · k_r / sqrt(d) ) over r <= s    # causal attention weights A
+    y_s = sum_{r<=s} alpha_{r->s} v_r              # attention output
+    g_s = dL/dy_s ~ N(mu_g, Sigma_g),  independent of x            # upstream gradient
+
+The theory predicts the EXPECTED squared per-position gradient norms E||dL/dq_i||^2,
+E||dL/dk_i||^2, E||dL/dv_i||^2 as closed forms in terms of:
+
+  * the realized attention matrix A         -> recorded here (fp8, lower-tri packed)
+  * input moments   mu_x (C,), Sigma_x (C,C) -> recorded here (per layer, per recorded step)
+  * grad moments    mu_g (D,), Sigma_g (D,D) -> recorded here (per layer, per head, per step)
+  * projection weights W_Q, W_K, W_V         -> recorded here (per layer, per step)
+
+From these, compute_constants() in the notebook builds:
+    Sigma_q = W_Q Sigma_x W_Q^T,  Sigma_v = W_V Sigma_x W_V^T,  G = mu_g mu_g^T + Sigma_g,
+    C_qv = W_Q Sigma_x W_V^T,     C_vk = W_V Sigma_x W_K^T,      mu_q = W_Q mu_x,  etc.
+
+Formulas under test:
+  * VALUE (exact):
+        E||dL/dv_i||^2 = ||mu_g||^2 (sum_{s>=i} alpha_{i->s})^2 + sigma_g^2 sum_{s>=i} alpha_{i->s}^2
+  * KEY / QUERY (approximate): the 4-term / 3-term boxed results with the same-position
+    C_qv / C_vk fourth-order corrections. Valid under the "fixed-attention" approximation
+    (treat A as decoupled from q,k,v fluctuations): exact for near-uniform attention,
+    degrading as attention sharpens.
+
+EXPERIMENTAL side (already recorded by the monitor in `{step}_attn.npz`): the measured
+per-head per-position ||dL/dq_i||^2, ||dL/dk_i||^2, ||dL/dv_i||^2 (q_grad/k_grad/v_grad).
+verify_against_theory() in plot_norm/read_attnstat.py compares formula(A, moments, W) to these.
+
+CAVEAT: the theory assumes the LINEAR map q = W_Q x with NO RoPE / QK-norm / x1.2 sharpening.
+For a faithful test, run this eval with --no-rope --no-qknorm --no-qk-scale (the model was
+trained with those off). Because we record the realized A directly, any formula evaluated on
+that A stays self-consistent regardless of these knobs.
 """
 
 import os
@@ -29,7 +73,7 @@ from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, find_last_step
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
@@ -79,6 +123,49 @@ def _quantize_uint8_batched(arr, outlier_pct):
     scale = np.where(rng > 0, rng / 255.0, 1.0).astype(np.float32)               # (N,)
     q = np.clip(np.round((a_clean - mn[:, None]) / scale[:, None]), 0, 255).astype(np.uint8)
     return q, scale, mn, top_idx, outlier_val
+
+
+# =============================================================================
+# exp3: lower-triangular fp16 packing of causal attention weights A
+# =============================================================================
+# Causal attention is lower-triangular: A[..., s, r] = 0 for r > s (a query at
+# position s only attends to keys r <= s). We therefore store ONLY the lower
+# triangle (including diagonal), which is exactly half (+ diagonal) the entries:
+#   number of kept entries = T*(T+1)/2.
+#
+# Packing layout (row-major over the lower triangle):
+#   idx = torch.tril_indices(T, T)  ->  shape (2, T*(T+1)/2)
+#   idx[0] = row (query) positions s, idx[1] = col (key) positions r, with r <= s,
+#   ordered as (s=0,r=0), (s=1,r=0), (s=1,r=1), (s=2,r=0), ... (row-major).
+#   packed[..., m] = A[..., idx[0][m], idx[1][m]]
+#
+# Quantization: fp16 (float16), 2 bytes per value. We use fp16 rather than fp8
+# because at long context the near-uniform attention weights are ~1/T (e.g.
+# 1/2048 ~ 5e-4), BELOW the smallest fp8-e4m3 magnitude (~2e-3) -> they would
+# flush to 0 and rows would not sum to 1. fp16 represents values down to ~6e-8,
+# so the full attention row is preserved and row-sums stay ~1.0.
+#
+# To UNPACK (in the standalone reader):
+#   import torch
+#   idx = torch.tril_indices(T, T)
+#   vals = packed_f16.astype(np.float32)                  # (..., T*(T+1)/2)
+#   A = np.zeros(packed_f16.shape[:-1] + (T, T), np.float32)
+#   A[..., idx[0], idx[1]] = vals          # scatter lower triangle back; upper stays 0
+#
+# A_PACKED_LEN(T) == T*(T+1)//2.
+def _tril_pack_f16(A_dense):
+    """Pack a dense causal attention tensor (..., T, T) into lower-triangular fp16.
+
+    Returns a float16 numpy array of shape (..., T*(T+1)//2) holding the lower
+    triangle in row-major order (see module comment for the exact layout).
+    Input may be a torch tensor (any device) or numpy array.
+    """
+    if not torch.is_tensor(A_dense):
+        A_dense = torch.as_tensor(A_dense)
+    T = A_dense.shape[-1]
+    idx = torch.tril_indices(T, T, device=A_dense.device)            # (2, T*(T+1)/2)
+    packed = A_dense[..., idx[0], idx[1]]                            # (..., T*(T+1)/2)
+    return packed.to(torch.float16).cpu().numpy()
 
 
 class GradientBiasMonitor:
@@ -210,6 +297,9 @@ class GradientBiasMonitor:
         self._n_kv_head         = spec["n_kv_head"]
         self._head_dim          = spec["head_dim"]
         self._n_layer           = len(self._hidden_modules)
+        self._n_embd            = int(orig_model.config.n_embd)   # C, attn input dim
+        # exp3: every attention module (for toggling eager A capture per record step)
+        self._attn_modules = [s["attn"] for s in self._attn_specs]
 
         # precompute metadata arrays used at flush time
         _t2i = {t: i for i, t in enumerate(self._layer_type_legend)}
@@ -243,6 +333,26 @@ class GradientBiasMonitor:
         # KV slabs: (K_win, A, L, 2, B, T, H_kv)   axis-3: 0=k, 1=v
         self._kv_act  = torch.zeros((K_win, A, L, 2, B, T, H_kv), dtype=torch.float16)
         self._kv_grad = torch.zeros((K_win, A, L, 2, B, T, H_kv), dtype=torch.float16)
+
+        # === exp3: attention-weight + moment staging ===
+        C = self._n_embd
+        D = self._head_dim
+        # Attention weights A, per (recorded-step, accum, layer, batch, head), stored as
+        # lower-triangular fp8 bytes (uint8). P = T*(T+1)/2 packed entries per (head, sample).
+        P = T * (T + 1) // 2
+        self._attn_P = P
+        # CPU fp16 slab. Dominant storage term; sized H_q (query heads) since A is per query head.
+        self._attnw_packed = torch.zeros((K_win, A, L, B, H_q, P), dtype=torch.float16)
+        # Input moments of the attention input x = norm(block_input), accumulated over
+        # (accum, batch, token positions) per (recorded-step, layer). fp64 running sums.
+        self._x_count = torch.zeros((K_win, L), dtype=torch.float64)               # # of x vectors summed
+        self._x_sum   = torch.zeros((K_win, L, C), dtype=torch.float64)            # sum_i x_i
+        self._x_xxT   = torch.zeros((K_win, L, C, C), dtype=torch.float64)         # sum_i x_i x_i^T
+        # Upstream-gradient moments of the per-head attention output gradient g = dL/dy,
+        # accumulated over (accum, batch, positions) per (recorded-step, layer, head).
+        self._g_count = torch.zeros((K_win, L, H_q), dtype=torch.float64)          # # of g vectors summed
+        self._g_sum   = torch.zeros((K_win, L, H_q, D), dtype=torch.float64)       # sum_i g_i
+        self._g_ggT   = torch.zeros((K_win, L, H_q, D, D), dtype=torch.float64)    # sum_i g_i g_i^T
         self._configured = True
 
     def set_step(self, global_step):
@@ -252,6 +362,10 @@ class GradientBiasMonitor:
         if self._record_this_step:
             self._s_idx = len(self._recorded_steps)
             self._recorded_steps.append(self._global_step)
+        # exp3: only let the eager attention stash A on record steps (avoids the slab cost
+        # and large (T,T) tensors on non-record steps).
+        for _attn in self._attn_modules:
+            _attn._record_attn_weights = self._record_this_step
 
     def advance_accum(self):
         self._accum_idx += 1
@@ -299,6 +413,8 @@ class GradientBiasMonitor:
                 continue
             attn_specs.append({
                 "layer_idx": i,
+                "attn":    attn,                  # the attention module (exp3: eager A + attn_in moments)
+                "c_proj":  getattr(attn, "c_proj", None),  # output proj (exp3: upstream-grad moments hook)
                 "proj":    {"q": attn.c_q, "k": attn.c_k, "v": attn.c_v},
                 "n_heads": {"q": int(attn.n_head),
                             "k": int(attn.n_kv_head),
@@ -342,6 +458,42 @@ class GradientBiasMonitor:
             return
         norms = tensor.detach().float().norm(dim=-1).to(torch.float16)  # (B, T) on GPU
         slab[self._s_idx, self._accum_idx, self._HS_IDX[stream_name], layer_idx].copy_(norms)
+
+    # ---------------- exp3: attention weights + theory-input moments ----------------
+    def _capture_attn_weights(self, layer_idx, attn_module):
+        """Read the eager-stashed per-head attention weights A (B, H_q, T, T), pack the
+        causal lower triangle to fp8 bytes, and copy into the uint8 staging slab."""
+        A = getattr(attn_module, "_last_attn_weights", None)
+        if A is None:
+            return
+        packed_f16 = _tril_pack_f16(A)                         # numpy (B, H_q, P) float16
+        dst = self._attnw_packed[self._s_idx, self._accum_idx, layer_idx]   # (B, H_q, P)
+        dst.copy_(torch.from_numpy(packed_f16))
+
+    def _accum_input_moments(self, layer_idx, x):
+        """Accumulate sum_i x_i and sum_i x_i x_i^T over all tokens in x (B, T, C),
+        into the running moment accumulators for (recorded-step, layer)."""
+        if x is None or x.dim() != 3:
+            return
+        xf = x.detach().float().reshape(-1, x.shape[-1])       # (B*T, C)
+        self._x_count[self._s_idx, layer_idx] += xf.shape[0]
+        self._x_sum[self._s_idx, layer_idx]   += xf.sum(dim=0).double().cpu()
+        self._x_xxT[self._s_idx, layer_idx]   += (xf.transpose(0, 1) @ xf).double().cpu()
+
+    def _accum_grad_moments(self, layer_idx, g_concat):
+        """Accumulate per-head sum_i g_i and sum_i g_i g_i^T from the concatenated
+        per-head attention-output gradient g_concat (B, T, H_q*D), into the running
+        moment accumulators for (recorded-step, layer, head)."""
+        if g_concat is None or g_concat.dim() != 3:
+            return
+        H, D = self._n_head, self._head_dim
+        g = g_concat.detach().float().reshape(-1, H, D)        # (B*T, H, D)
+        n = g.shape[0]
+        self._g_count[self._s_idx, layer_idx] += n
+        self._g_sum[self._s_idx, layer_idx]   += g.sum(dim=0).double().cpu()        # (H, D)
+        # per-head outer products: sum_i g_i g_i^T  -> (H, D, D)
+        ggT = torch.einsum("nhd,nhe->hde", g, g)
+        self._g_ggT[self._s_idx, layer_idx]   += ggT.double().cpu()
 
     def _setup_hooks(self):
         # --- hidden-state hooks: capture 4 residual-stream points per layer ---
@@ -388,8 +540,13 @@ class GradientBiasMonitor:
                 def fwd_hook(module, inp, output):
                     if not module.training or not self._record_this_step:
                         return
-                    self._write_hidden(self._hidden_act, "attn_in",  layer_idx, _first(inp))
+                    attn_in = _first(inp)   # norm(x): the attention input (B, T, C)
+                    self._write_hidden(self._hidden_act, "attn_in",  layer_idx, attn_in)
                     self._write_hidden(self._hidden_act, "attn_out", layer_idx, _first(output))
+                    # exp3: capture realized attention weights A (stashed by eager forward),
+                    # and accumulate the input moments mu_x / Sigma_x from norm(x).
+                    self._capture_attn_weights(layer_idx, module)
+                    self._accum_input_moments(layer_idx, attn_in)
                 return fwd_hook
 
             def make_bwd_attn(layer_idx):
@@ -402,6 +559,20 @@ class GradientBiasMonitor:
 
             self._hooks.append(attn.register_forward_hook(make_fwd_attn(i)))
             self._hooks.append(attn.register_full_backward_hook(make_bwd_attn(i)))
+
+            # ---- exp3: c_proj backward hook -> upstream per-head attention-output grad moments ----
+            # c_proj maps the concatenated per-head attention output y (B,T,H*D) -> residual (B,T,C).
+            # Its grad_input[0] = dL/d(c_proj input) = dL/dy, the per-head attention-output gradient
+            # the theory calls g_s. We accumulate mu_g / Sigma_g per (step, layer, head) from it.
+            c_proj = getattr(attn, "c_proj", None)
+            if c_proj is not None:
+                def make_bwd_cproj(layer_idx):
+                    def bwd_hook(module, grad_input, grad_output):
+                        if not module.training or not self._record_this_step:
+                            return
+                        self._accum_grad_moments(layer_idx, _first(grad_input))
+                    return bwd_hook
+                self._hooks.append(c_proj.register_full_backward_hook(make_bwd_cproj(i)))
 
         # --- Q/K/V hooks on every discovered attention layer ---
         for spec in self._attn_specs:
@@ -468,6 +639,22 @@ class GradientBiasMonitor:
             return np.stack(gathered, axis=0)
         return None
 
+    def _reduce_sum(self, cpu_tensor):
+        """Sum a CPU tensor across DDP ranks (running-sum moment accumulators).
+        Returns a numpy array on rank 0; None on other ranks. Single-rank: copy.
+
+        NOTE: returns a COPY, never a view of the accumulator storage — flush()
+        zeros the accumulators after this call, which would otherwise wipe the
+        returned data (these tensors alias their numpy() buffer)."""
+        local_np = cpu_tensor.contiguous().numpy().copy()
+        if self.world_size <= 1 or not is_ddp_initialized():
+            return local_np
+        gathered = [None] * self.world_size
+        dist.all_gather_object(gathered, local_np)
+        if self.rank == 0:
+            return np.sum(np.stack(gathered, axis=0), axis=0)
+        return None
+
     def flush(self, global_step=None, force=False):
         if not self._configured:
             return
@@ -486,10 +673,37 @@ class GradientBiasMonitor:
         kv_act_g  = self._gather_slab(self._kv_act[:n])             # (R, n, A, L, 2, B, T, H_kv)
         kv_grad_g = self._gather_slab(self._kv_grad[:n])
 
+        # === exp3: gather attention weights (per-sample, stacked over ranks) and reduce moments. ===
+        attnw_g = self._gather_slab(self._attnw_packed[:n])        # (R, n, A, L, B, H_q, P) uint8 or None
+        # Moments are running SUMS over (accum, batch, pos): sum them across ranks (not stack).
+        x_count_r = self._reduce_sum(self._x_count[:n])           # (n, L) or None
+        x_sum_r   = self._reduce_sum(self._x_sum[:n])             # (n, L, C)
+        x_xxT_r   = self._reduce_sum(self._x_xxT[:n])             # (n, L, C, C)
+        g_count_r = self._reduce_sum(self._g_count[:n])           # (n, L, H_q)
+        g_sum_r   = self._reduce_sum(self._g_sum[:n])             # (n, L, H_q, D)
+        g_ggT_r   = self._reduce_sum(self._g_ggT[:n])            # (n, L, H_q, D, D)
+
+        # Snapshot projection weights W_q/W_k/W_v per layer (same on all ranks; rank 0 reads them).
+        # Weights are constant within this flush window's steps only if the model is fixed (exp3
+        # eval is fixed). Stored once per window (the trained checkpoint is frozen during eval).
+        W_q_np = W_k_np = W_v_np = None
+        if self.rank == 0:
+            W_q_list, W_k_list, W_v_list = [], [], []
+            for spec in self._attn_specs:
+                W_q_list.append(spec["proj"]["q"].weight.detach().float().cpu().numpy())
+                W_k_list.append(spec["proj"]["k"].weight.detach().float().cpu().numpy())
+                W_v_list.append(spec["proj"]["v"].weight.detach().float().cpu().numpy())
+            W_q_np = np.stack(W_q_list, axis=0).astype(np.float16)   # (L, H_q*D, C)
+            W_k_np = np.stack(W_k_list, axis=0).astype(np.float16)   # (L, H_kv*D, C)
+            W_v_np = np.stack(W_v_list, axis=0).astype(np.float16)   # (L, H_kv*D, C)
+
         # Reset staging for the next window (every rank).
         recorded_steps = self._recorded_steps
         self._recorded_steps = []
         self._s_idx = 0
+        # exp3: zero the moment accumulators for the next window.
+        self._x_count.zero_(); self._x_sum.zero_(); self._x_xxT.zero_()
+        self._g_count.zero_(); self._g_sum.zero_(); self._g_ggT.zero_()
 
         if self.rank != 0:
             return
@@ -609,6 +823,64 @@ class GradientBiasMonitor:
                 outlier_pct=np.float32(self._outlier_pct),
             )
 
+        # -------- exp3: ATTENTION WEIGHTS + THEORY-INPUT MOMENTS (_attnstat.npz) --------
+        # Everything needed to evaluate the closed-form gradient theory on the realized
+        # attention, alongside the experimental q/k/v grad norms in {step}_attn.npz.
+        if H_q > 0 and attnw_g is not None:
+            D = self._head_dim
+            P = self._attn_P
+            # attnw_g: (R, n=S, A, L, B, H_q, P) uint8 -> (S, A, R, B, L, H_q, P)
+            attn_weights = attnw_g.transpose(1, 2, 0, 4, 3, 5, 6).copy()
+
+            # Finalize input moments mu_x (S,L,C), Sigma_x (S,L,C,C) from running sums.
+            cnt_x = np.maximum(x_count_r, 1.0)[..., None]                 # (S,L,1)
+            mu_x = (x_sum_r / cnt_x).astype(np.float32)                   # (S,L,C)
+            # Sigma_x = E[xx^T] - mu mu^T   (population covariance over tokens)
+            ex_xxT = x_xxT_r / np.maximum(x_count_r, 1.0)[..., None, None]  # (S,L,C,C)
+            Sigma_x = (ex_xxT - mu_x[..., :, None] * mu_x[..., None, :]).astype(np.float32)
+
+            # Finalize grad moments mu_g (S,L,H,D), Sigma_g (S,L,H,D,D).
+            cnt_g = np.maximum(g_count_r, 1.0)[..., None]                 # (S,L,H,1)
+            mu_g = (g_sum_r / cnt_g).astype(np.float32)                   # (S,L,H,D)
+            eg_ggT = g_ggT_r / np.maximum(g_count_r, 1.0)[..., None, None]  # (S,L,H,D,D)
+            Sigma_g = (eg_ggT - mu_g[..., :, None] * mu_g[..., None, :]).astype(np.float32)
+
+            # Projection weights are per-layer (model fixed during eval); broadcast a step axis
+            # so the reader indexes them uniformly with everything else.
+            W_q = np.broadcast_to(W_q_np[None], (S,) + W_q_np.shape).copy()  # (S,L,H_q*D,C)
+            W_k = np.broadcast_to(W_k_np[None], (S,) + W_k_np.shape).copy()  # (S,L,H_kv*D,C)
+            W_v = np.broadcast_to(W_v_np[None], (S,) + W_v_np.shape).copy()  # (S,L,H_kv*D,C)
+
+            np.savez_compressed(
+                os.path.join(out_dir, f"{step_tag}_attnstat.npz"),
+                # --- attention weights A (causal, fp16, lower-triangular packed) ---
+                attn_weights=attn_weights,            # (S, A, R, B, L, H_q, P) float16
+                attn_dtype=np.array("float16"),       # dtype of attn_weights
+                tri_packed=np.array(True),            # lower-triangular packed (see _tril_pack_f16)
+                packed_len=np.int32(P),               # P = T*(T+1)//2
+                # --- input moments of attn input x = norm(block_input) ---
+                mu_x=mu_x, Sigma_x=Sigma_x,           # (S,L,C), (S,L,C,C)
+                x_count=x_count_r.astype(np.int64),   # (S,L) tokens summed (for reference)
+                # --- upstream per-head attention-output gradient moments g = dL/dy ---
+                mu_g=mu_g, Sigma_g=Sigma_g,           # (S,L,H_q,D), (S,L,H_q,D,D)
+                g_count=g_count_r.astype(np.int64),   # (S,L,H_q)
+                # --- projection weights ---
+                W_q=W_q, W_k=W_k, W_v=W_v,            # (S,L,*,C) fp16
+                # --- metadata ---
+                global_steps=global_steps_arr,
+                layer_types=layer_types_arr,
+                layer_type_legend=layer_type_legend,
+                n_head=np.int32(H_q),
+                n_kv_head=np.int32(H_kv),
+                head_dim=np.int32(D),
+                n_embd=np.int32(n_elements),
+                seq_len=np.int32(T),
+                device_batch_size=np.int32(B),
+                world_size=np.int32(R),
+                grad_accum_steps=np.int32(A),
+                format_version=np.int32(1),
+            )
+
     def remove_hooks(self):
         for h in self._hooks:
             try:
@@ -665,6 +937,11 @@ parser.add_argument("--no-resid-lambdas",  action="store_true", help="disable pe
 parser.add_argument("--no-value-residual", action="store_true", help="disable ResFormer value embeddings")
 parser.add_argument("--no-backout",        action="store_true", help="disable mid-layer backout subtraction")
 parser.add_argument("--no-rope",            action="store_true", help="disable RoPE (rotary positional embedding); QK-norm and x1.2 sharpening are kept")
+parser.add_argument("--no-qknorm",          action="store_true", help="disable QK-norm on Q/K")
+parser.add_argument("--no-qk-scale",        action="store_true", help="disable the x1.2 Q/K sharpening scale")
+
+# === exp3 eval: which checkpoint to load and run the eval pass on ===
+parser.add_argument("--step", type=int, default=None, help="checkpoint step to load (default: last step in the model-tag dir)")
 
 # === NEW (norm monitoring): flags ===
 parser.add_argument("--monitor-debug", action="store_true", help="print a debug line when the first monitor fwd hook fires")
@@ -760,6 +1037,8 @@ def build_model_meta(depth):
         use_value_residual = not args.no_value_residual,
         use_backout        = not args.no_backout,
         use_rope           = not args.no_rope,
+        use_qknorm         = not args.no_qknorm,
+        use_qk_scale       = not args.no_qk_scale,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -773,16 +1052,21 @@ print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
 
-# If we are resuming, overwrite the model parameters with those of the checkpoint
+# === exp3 eval: ALWAYS load the trained model from a checkpoint and run a fixed eval pass. ===
+# (We overwrite the freshly-initialized params with the checkpoint's state_dict. The model is
+#  not trained here — see the commented-out optimizer.step() in the loop below.)
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
-resuming = args.resume_from_step != -1
-if resuming:
-    print0(f"Resuming optimization from step {args.resume_from_step}")
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
-    model.load_state_dict(model_data, strict=True, assign=True)
-    del model_data # free up this memory after the copy
+load_step = args.step if args.step is not None else find_last_step(checkpoint_dir)
+print0(f"exp3 eval: loading checkpoint from {checkpoint_dir} at step {load_step}")
+model_data, _optimizer_data_unused, meta_data = load_checkpoint(checkpoint_dir, load_step, device, load_optimizer=False, rank=ddp_rank)
+# torch.compile checkpoints prepend "_orig_mod." to keys; strip it for a clean load.
+model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
+model.load_state_dict(model_data, strict=True, assign=True)
+del model_data # free up this memory after the copy
+# `resuming` is kept for downstream code paths that reference it; eval never resumes optimizer state.
+resuming = False
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
@@ -862,6 +1146,92 @@ def disable_fp8(model):
         for parent, attr_name, fp8_module in fp8_locations:
             setattr(parent, attr_name, fp8_module)
 
+# =============================================================================
+# === exp3 eval: in-place swap attention forward to an EAGER softmax that
+# === materializes the per-head attention weight matrix A (FA3/SDPA are fused
+# === kernels and never expose A). We monkey-patch CausalSelfAttention.forward
+# === at the class level so every layer uses it. The eager forward stashes
+# === A on the module (`_last_attn_weights`) for the monitor's fwd hook to read.
+# === It reuses the SAME parameters as the trained model — load_state_dict has
+# === already populated c_q/c_k/c_v/c_proj — so no new model file is needed.
+# =============================================================================
+import torch.nn.functional as _F
+from nanochat.gpt import CausalSelfAttention as _CSA, apply_rotary_emb as _apply_rotary_emb, norm as _qk_norm
+
+def _eager_attention_forward(self, x, ve, cos_sin, window_size, kv_cache):
+    """Eager re-implementation of CausalSelfAttention.forward that returns A.
+
+    Mirrors nanochat/gpt.py CausalSelfAttention.forward exactly (projections,
+    optional value-residual, optional RoPE / QK-norm / x1.2 scale), but computes
+    attention with an explicit softmax so the weights A = softmax(scores) are
+    materialized. Training path only (kv_cache is None); inference falls back to
+    the original fused forward. When self._record_attn_weights is set, the realized
+    per-head A (B, H_q, T, T) is detached and stashed on self._last_attn_weights.
+    """
+    if kv_cache is not None:
+        # Inference path is unchanged — defer to the original fused implementation.
+        return _ORIG_CSA_FORWARD(self, x, ve, cos_sin, window_size, kv_cache)
+
+    B, T, C = x.size()
+    q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+    k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+    v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+
+    if self.use_value_residual and ve is not None:
+        ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+        gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
+        v = v + gate.unsqueeze(-1) * ve
+
+    if self.use_rope:
+        cos, sin = cos_sin
+        q, k = _apply_rotary_emb(q, cos, sin), _apply_rotary_emb(k, cos, sin)
+    if self.use_qknorm:
+        q, k = _qk_norm(q), _qk_norm(k)
+    if self.use_qk_scale:
+        q = q * 1.2
+        k = k * 1.2
+
+    # Move to (B, H, T, D) for batched matmul. Expand GQA kv-heads to query-head count
+    # so A is per query head (B, H_q, T, T).
+    n_rep = self.n_head // self.n_kv_head
+    qh = q.transpose(1, 2)                                  # (B, H_q, T, D)
+    kh = k.transpose(1, 2)                                  # (B, H_kv, T, D)
+    vh = v.transpose(1, 2)                                  # (B, H_kv, T, D)
+    if n_rep > 1:
+        kh = kh.repeat_interleave(n_rep, dim=1)             # (B, H_q, T, D)
+        vh = vh.repeat_interleave(n_rep, dim=1)
+
+    scale = 1.0 / math.sqrt(self.head_dim)                  # same 1/sqrt(d) scale as FA3/SDPA
+    scores = torch.matmul(qh, kh.transpose(-2, -1)) * scale # (B, H_q, T, T); scores[b,h,s,r]=q_s·k_r/sqrt(d)
+
+    # Causal mask (r > s masked) + optional sliding window (keep s-window <= r <= s).
+    device = scores.device
+    s_idx = torch.arange(T, device=device).unsqueeze(1)     # query position s (rows)
+    r_idx = torch.arange(T, device=device).unsqueeze(0)     # key position r (cols)
+    allowed = r_idx <= s_idx                                # causal
+    left = window_size[0]
+    if left is not None and left >= 0 and left < T:
+        allowed = allowed & ((s_idx - r_idx) <= left)       # sliding window (left tokens)
+    scores = scores.masked_fill(~allowed, float("-inf"))
+
+    A = _F.softmax(scores, dim=-1)                          # (B, H_q, T, T); softmax over keys r
+    if getattr(self, "_record_attn_weights", False):
+        self._last_attn_weights = A.detach()                # for the monitor's attn fwd hook
+    yh = torch.matmul(A, vh)                                # (B, H_q, T, D)
+    y = yh.transpose(1, 2).contiguous().view(B, T, -1)      # (B, T, H_q*D)
+    y = self.c_proj(y)
+    return y
+
+_ORIG_CSA_FORWARD = _CSA.forward
+_CSA.forward = _eager_attention_forward
+# give every attention module the runtime attributes the eager path / monitor use
+# (`model` here is still the uncompiled model; orig_model is bound to it just below)
+for _blk in model.transformer.h:
+    if getattr(_blk, "attn", None) is not None:
+        _blk.attn._record_attn_weights = False
+        _blk.attn._last_attn_weights = None
+print0("exp3 eval: patched CausalSelfAttention.forward -> eager (materializes attention weights A)")
+
 # -----------------------------------------------------------------------------
 # Compile the model
 
@@ -880,9 +1250,18 @@ monitor = GradientBiasMonitor(
 )
 print0(f"GradientBiasMonitor attached: {len(orig_model.transformer.h)} layers "
        f"(layer_types={monitor._layer_types})")
+# exp3: estimate attention-weight storage so the user can size --monitor-steps-per-file.
+_T = args.max_seq_len
+_P = _T * (_T + 1) // 2
+_attn_bytes_per_sample = _P * monitor._n_head * monitor._n_layer * 2  # fp16 = 2 bytes/value, all layers, all q-heads
+print0(f"exp3 attn-weight storage estimate: packed fp16 A ~= {_attn_bytes_per_sample/1e6:.2f} MB / sample "
+       f"(P={_P} x H_q={monitor._n_head} x L={monitor._n_layer}); "
+       f"x grad_accum x world x device_batch x monitor_steps_per_file per file.")
 # === END NEW ===
 
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+# exp3 eval: do NOT torch.compile — the eager attention monkey-patch + fwd/bwd hooks that
+# capture A and the moments must run in eager mode to be reliable. (model stays uncompiled.)
+# model = torch.compile(model, dynamic=False)
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -1118,30 +1497,21 @@ while True:
             print0(tokenizer.decode(sample[0]))
         model.train()
 
-    # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
-        save_checkpoint(
-            checkpoint_dir,
-            step,
-            orig_model.state_dict(), # model parameters
-            optimizer.state_dict(), # optimizer state
-            { # metadata saved as json
-                "step": step,
-                "val_bpb": val_bpb, # loss at last step
-                "model_config": model_config_kwargs,
-                "user_config": user_config, # inputs to the training script
-                "device_batch_size": args.device_batch_size,
-                "max_seq_len": args.max_seq_len,
-                "total_batch_size": total_batch_size,
-                "dataloader_state_dict": dataloader_state_dict,
-                "loop_state": { # all loop state (other than step) so that we can resume training
-                    "min_val_bpb": min_val_bpb,
-                    "smooth_train_loss": smooth_train_loss,
-                    "total_training_time": total_training_time,
-                },
-            },
-            rank=ddp_rank,
-        )
+    # === exp3 eval: NO checkpoint saving — this is an eval pass on a fixed model, and we must
+    # not overwrite the trained checkpoint we loaded from. (Original save block left below,
+    # commented out, for an easy diff vs exp2_base_train.py.)
+    # if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+    #     save_checkpoint(
+    #         checkpoint_dir, step,
+    #         orig_model.state_dict(), optimizer.state_dict(),
+    #         { "step": step, "val_bpb": val_bpb, "model_config": model_config_kwargs,
+    #           "user_config": user_config, "device_batch_size": args.device_batch_size,
+    #           "max_seq_len": args.max_seq_len, "total_batch_size": total_batch_size,
+    #           "dataloader_state_dict": dataloader_state_dict,
+    #           "loop_state": {"min_val_bpb": min_val_bpb, "smooth_train_loss": smooth_train_loss,
+    #                          "total_training_time": total_training_time}, },
+    #         rank=ddp_rank,
+    #     )
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
@@ -1167,27 +1537,31 @@ while True:
         # === NEW (norm monitoring): advance accum index so next micro-step caches separately ===
         monitor.advance_accum()
         # === END NEW ===
-    # step the optimizer
-    lrm = get_lr_multiplier(step)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(step)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
-    if scaler is not None:
-        scaler.unscale_(optimizer)
-        # In distributed training, all ranks must agree on whether to skip the step.
-        # Each rank may independently encounter inf/nan gradients, so we all-reduce
-        # the found_inf flag (MAX = if any rank found inf, all ranks skip).
-        if is_ddp_initialized():
-            for v in scaler._found_inf_per_device(optimizer).values():
-                dist.all_reduce(v, op=dist.ReduceOp.MAX)
-        scaler.step(optimizer)
-        scaler.update()
-    else:
-        optimizer.step()
+    # === exp3 eval: the model stays FIXED — NO optimizer step. ===
+    # We keep loss.backward() above (so gradients are produced for the monitor/hooks) and
+    # model.zero_grad() below (so grads are cleared each step), but the optimizer update and
+    # LR/momentum/weight-decay scheduling are commented out. Left in place for an easy diff
+    # vs exp2_base_train.py.
+    lrm = get_lr_multiplier(step)  # kept for logging only
+    # muon_momentum = get_muon_momentum(step)
+    # muon_weight_decay = get_weight_decay(step)
+    # for group in optimizer.param_groups:
+    #     group["lr"] = group["initial_lr"] * lrm
+    #     if group['kind'] == 'muon':
+    #         group["momentum"] = muon_momentum
+    #         group["weight_decay"] = muon_weight_decay
+    # if scaler is not None:
+    #     scaler.unscale_(optimizer)
+    #     # In distributed training, all ranks must agree on whether to skip the step.
+    #     # Each rank may independently encounter inf/nan gradients, so we all-reduce
+    #     # the found_inf flag (MAX = if any rank found inf, all ranks skip).
+    #     if is_ddp_initialized():
+    #         for v in scaler._found_inf_per_device(optimizer).values():
+    #             dist.all_reduce(v, op=dist.ReduceOp.MAX)
+    #     scaler.step(optimizer)
+    #     scaler.update()
+    # else:
+    #     optimizer.step()
     model.zero_grad(set_to_none=True)
     # === NEW (norm monitoring): flush collected records to parquet ===
     monitor.flush(step)
